@@ -17,6 +17,7 @@
  */
 
 #include "domain_rule.h"
+#include "geosite.h"
 #include "address.h"
 #include "cname.h"
 #include "dns_conf_group.h"
@@ -321,6 +322,10 @@ static int _config_domain_rule_set_each(const char *domain_set, set_rule_add_fun
 			}
 			break;
 		case DNS_DOMAIN_SET_GEOSITE:
+			/* For geosite type, use the file field as the geosite-set name */
+			if (geosite_set_foreach_domain(set_name_item->file, callback, priv) != 0) {
+				tlog(TLOG_WARN, "geosite-set %s domain iteration failed.", set_name_item->file);
+			}
 			break;
 		default:
 			tlog(TLOG_WARN, "domain set %s type %d not support.", set_name_list->name, set_name_item->type);

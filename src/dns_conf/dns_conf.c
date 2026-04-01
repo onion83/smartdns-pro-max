@@ -34,6 +34,7 @@
 #include "dns_conf_group.h"
 #include "domain_rule.h"
 #include "domain_set.h"
+#include "geosite.h"
 #include "group.h"
 #include "host_file.h"
 #include "https_record.h"
@@ -229,6 +230,8 @@ static struct config_item _config_item[] = {
 	CONF_CUSTOM("edns-client-subnet", _conf_edns_client_subnet, NULL),
 	CONF_CUSTOM("domain-rules", _config_domain_rules, NULL),
 	CONF_CUSTOM("domain-set", _config_domain_set, NULL),
+	CONF_CUSTOM("geosite-dat", _config_geosite_dat, NULL),
+	CONF_CUSTOM("geosite-set", _config_geosite_set, NULL),
 	CONF_CUSTOM("ddns-domain", _config_ddns_domain, NULL),
 	CONF_CUSTOM("local-domain", _config_local_domain, NULL),
 	CONF_CUSTOM("dnsmasq-lease-file", _conf_dhcp_lease_dnsmasq_file, NULL),
@@ -331,6 +334,8 @@ static int _dns_server_load_conf_init(void)
 	_config_domain_set_name_table_init();
 	_config_ip_set_name_table_init();
 	_config_plugin_table_init();
+	geosite_dat_table_init();
+	geosite_set_table_init();
 
 	if (_config_current_group_push_default() != 0) {
 		tlog(TLOG_ERROR, "init default group failed.");
@@ -352,6 +357,8 @@ void dns_server_load_exit(void)
 	_config_proxy_table_destroy();
 	_config_plugin_table_destroy();
 	_config_plugin_table_conf_destroy();
+	geosite_dat_table_destroy();
+	geosite_set_table_destroy();
 
 	dns_conf.server_num = 0;
 	dns_server_bind_destroy();

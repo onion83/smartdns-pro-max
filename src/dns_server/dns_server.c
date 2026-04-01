@@ -30,6 +30,7 @@
 #include "connection.h"
 #include "context.h"
 #include "dualstack.h"
+#include "../dns_conf/geosite.h"
 #include "ip_rule.h"
 #include "local_addr.h"
 #include "mdns.h"
@@ -670,6 +671,7 @@ static void _dns_server_period_run_second(void)
 		if (dns_server_check_update_hosts() == 0) {
 			tlog(TLOG_INFO, "Update host file data");
 		}
+		geosite_check_and_update();
 	}
 
 	_dns_server_save_cache_to_file();

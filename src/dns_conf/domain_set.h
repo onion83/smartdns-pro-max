@@ -32,6 +32,9 @@ void _config_domain_set_name_table_init(void);
 
 void _config_domain_set_name_table_destroy(void);
 
+/* Register a geosite set to domain_set_name_table for domain-rules usage */
+int _config_domain_set_geosite_add(const char *set_name);
+
 #ifdef __cplusplus
 }
 #endif /*__cplusplus */

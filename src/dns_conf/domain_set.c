@@ -150,3 +150,58 @@ void _config_domain_set_name_table_destroy(void)
 		free(set_name_list);
 	}
 }
+
+int _config_domain_set_geosite_add(const char *set_name)
+{
+	uint32_t key = 0;
+	struct dns_domain_set_name *domain_set = NULL;
+	struct dns_domain_set_name_list *domain_set_name_list = NULL;
+
+	if (set_name == NULL || set_name[0] == 0) {
+		return -1;
+	}
+
+	/* Check if already exists */
+	key = hash_string(set_name);
+	hash_for_each_possible(dns_domain_set_name_table.names, domain_set_name_list, node, key)
+	{
+		if (strcmp(domain_set_name_list->name, set_name) == 0) {
+			/* Already exists, check if there's already a geosite type */
+			struct dns_domain_set_name *existing = NULL;
+			list_for_each_entry(existing, &domain_set_name_list->set_name_list, list)
+			{
+				if (existing->type == DNS_DOMAIN_SET_GEOSITE) {
+					/* Already registered */
+					return 0;
+				}
+			}
+			break;
+		}
+	}
+
+	/* Create new domain_set entry for geosite */
+	domain_set = zalloc(1, sizeof(*domain_set));
+	if (domain_set == NULL) {
+		tlog(TLOG_ERROR, "cannot malloc memory for domain_set.");
+		return -1;
+	}
+
+	INIT_LIST_HEAD(&domain_set->list);
+	domain_set->type = DNS_DOMAIN_SET_GEOSITE;
+	safe_strncpy(domain_set->file, set_name, DNS_MAX_PATH);
+
+	if (domain_set_name_list == NULL) {
+		domain_set_name_list = zalloc(1, sizeof(*domain_set_name_list));
+		if (domain_set_name_list == NULL) {
+			free(domain_set);
+			tlog(TLOG_ERROR, "cannot malloc memory for domain_set_name_list.");
+			return -1;
+		}
+		INIT_LIST_HEAD(&domain_set_name_list->set_name_list);
+		safe_strncpy(domain_set_name_list->name, set_name, DNS_MAX_CNAME_LEN);
+		hash_add(dns_domain_set_name_table.names, &domain_set_name_list->node, key);
+	}
+
+	list_add_tail(&domain_set->list, &domain_set_name_list->set_name_list);
+	return 0;
+}

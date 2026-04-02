@@ -72,6 +72,21 @@ static struct dns_domain_rule *_alloc_domain_rule(uint8_t capacity)
 }
 
 /*
+ * Check if domain string is a domain-set or geosite-set reference.
+ * Returns the set name pointer after the prefix, or NULL if not a set reference.
+ */
+static inline const char *_domain_get_set_name(const char *domain)
+{
+	if (strncmp(domain, "domain-set:", sizeof("domain-set:") - 1) == 0) {
+		return domain + sizeof("domain-set:") - 1;
+	}
+	if (strncmp(domain, "geosite-set:", sizeof("geosite-set:") - 1) == 0) {
+		return domain + sizeof("geosite-set:") - 1;
+	}
+	return NULL;
+}
+
+/*
  * Ensure the domain rule has enough capacity for the given rule type
  * Reallocates if necessary, preserving existing rules
  */
@@ -360,6 +375,13 @@ static int _config_setup_domain_key(const char *domain, char *domain_key, int do
 		len--;
 	}
 
+	/* prefix '+': same as default suffix match (domain + all subdomains) */
+	if (domain[0] == '+' && domain_len > 1 && domain[1] == '.') {
+		domain += 2;
+		len -= 2;
+		domain_len = len;
+	}
+
 	reverse_string(domain_key + 1, domain, len, 1);
 	if (domain[0] == '*' && domain_len > 1) {
 		/* prefix wildcard */
@@ -460,9 +482,9 @@ int _config_domain_rule_delete(const char *domain)
 	char domain_key[DNS_MAX_CONF_CNAME_LEN] = {0};
 	int len = 0;
 
-	if (strncmp(domain, "domain-set:", sizeof("domain-set:") - 1) == 0) {
-		return _config_domain_rule_set_each(domain + sizeof("domain-set:") - 1, _config_domain_rule_delete_callback,
-											NULL);
+	const char *del_set_ref = _domain_get_set_name(domain);
+	if (del_set_ref != NULL) {
+		return _config_domain_rule_set_each(del_set_ref, _config_domain_rule_delete_callback, NULL);
 	}
 	/* Reverse string, for suffix match */
 
@@ -579,9 +601,9 @@ int _config_domain_rule_remove(const char *domain, enum domain_rule type)
 		return -1;
 	}
 
-	if (strncmp(domain, "domain-set:", sizeof("domain-set:") - 1) == 0) {
-		return _config_domain_rule_set_each(domain + sizeof("domain-set:") - 1, _config_domain_rule_delete_callback,
-											NULL);
+	const char *rem_set_ref = _domain_get_set_name(domain);
+	if (rem_set_ref != NULL) {
+		return _config_domain_rule_set_each(rem_set_ref, _config_domain_rule_delete_callback, NULL);
 	}
 
 	if (_config_setup_domain_key(domain, domain_key, sizeof(domain_key), &len, &root_rule_only, &sub_rule_only) != 0) {
@@ -617,12 +639,12 @@ int _config_domain_rule_add(const char *domain, enum domain_rule type, void *rul
 	int sub_rule_only = 0;
 	int root_rule_only = 0;
 
-	if (strncmp(domain, "domain-set:", sizeof("domain-set:") - 1) == 0) {
+	const char *set_name = _domain_get_set_name(domain);
+	if (set_name != NULL) {
 		struct dns_set_rule_add_callback_args args;
 		args.type = type;
 		args.rule = rule;
-		return _config_domain_rule_set_each(domain + sizeof("domain-set:") - 1, _config_domain_rule_add_callback,
-											&args);
+		return _config_domain_rule_set_each(set_name, _config_domain_rule_add_callback, &args);
 	}
 
 	/* Reverse string, for suffix match */
@@ -630,12 +652,10 @@ int _config_domain_rule_add(const char *domain, enum domain_rule type, void *rul
 		goto errout;
 	}
 
-	if (type >= DOMAIN_RULE_MAX) {
-		goto errout;
-	}
+	struct dns_conf_group *rg = _config_current_rule_group();
 
 	/* Get existing domain rule */
-	domain_rule = art_search(&_config_current_rule_group()->domain_rule.tree, (unsigned char *)domain_key, len);
+	domain_rule = art_search(&rg->domain_rule.tree, (unsigned char *)domain_key, len);
 
 	/* Track if this is a new allocation (before capacity expansion) */
 	int was_new_allocation = (domain_rule == NULL);
@@ -898,6 +918,8 @@ int _config_domain_rules(void *data, int argc, char *argv[])
 	const char *group = NULL;
 	char group_name[DNS_MAX_CONF_CNAME_LEN];
 
+
+
 	/* clang-format off */
 	static struct option long_options[] = {
 		{"speed-check-mode", required_argument, NULL, 'c'},
@@ -928,17 +950,32 @@ int _config_domain_rules(void *data, int argc, char *argv[])
 		goto errout;
 	}
 
-	if (_get_domain(value, domain, DNS_MAX_CONF_CNAME_LEN, &value) != 0) {
-		goto errout;
-	}
-
-	/* check domain set exists. */
-	if (strncmp(domain, "domain-set:", sizeof("domain-set:") - 1) == 0) {
-		const char *set_name = domain + sizeof("domain-set:") - 1;
-		struct dns_domain_set_name_list *name = _config_get_domain_set_name_list(set_name);
+	/* Check for domain-set: or geosite-set: prefix before calling _get_domain */
+	const char *set_ref = _domain_get_set_name(value);
+	if (set_ref != NULL) {
+		safe_strncpy(domain, value, DNS_MAX_CONF_CNAME_LEN);
+		struct dns_domain_set_name_list *name = _config_get_domain_set_name_list(set_ref);
 		if (name == NULL) {
-			tlog(TLOG_ERROR, "domain set '%s' not found.", set_name);
+			tlog(TLOG_ERROR, "domain set '%s' not found.", set_ref);
 			goto errout;
+		}
+		/* Save for reload on geosite data update */
+		geosite_save_domain_rule(value, argc, argv);
+	} else {
+		if (_get_domain(value, domain, DNS_MAX_CONF_CNAME_LEN, &value) != 0) {
+			tlog(TLOG_ERROR, "failed to parse domain '%s'", argv[1]);
+			goto errout;
+		}
+		/* Check if _get_domain extracted a domain-set/geosite-set reference (e.g., /geosite-set:name/) */
+		set_ref = _domain_get_set_name(domain);
+		if (set_ref != NULL) {
+			struct dns_domain_set_name_list *name = _config_get_domain_set_name_list(set_ref);
+			if (name == NULL) {
+				tlog(TLOG_ERROR, "domain set '%s' not found.", set_ref);
+				goto errout;
+			}
+			/* Save for reload on geosite data update */
+			geosite_save_domain_rule(domain, argc, argv);
 		}
 	}
 

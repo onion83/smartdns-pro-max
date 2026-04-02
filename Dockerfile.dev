@@ -6,7 +6,7 @@ LABEL description="SmartDNS development environment"
 # Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install development tools and dependencies
+# Install development tools and dependencies (no libcurl-dev: use source build)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libssl-dev \
@@ -16,9 +16,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make \
     git \
     curl \
+    ca-certificates \
     vim \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Build libcurl static library from source into /opt/curl
+# (outside /smartdns to avoid volume mount shadowing)
+COPY third_party/build_curl.sh /tmp/build_curl.sh
+RUN chmod +x /tmp/build_curl.sh && \
+    LOCAL_CURL_INSTALL=/opt/curl /tmp/build_curl.sh && \
+    rm -f /tmp/build_curl.sh
+
+# Tell smartdns Makefile to use the pre-built libcurl
+ENV LOCAL_CURL_DIR=/opt/curl
 
 # Set working directory
 WORKDIR /smartdns

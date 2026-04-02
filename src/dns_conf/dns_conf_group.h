@@ -34,6 +34,7 @@ struct dns_conf_group_info {
 };
 
 extern struct dns_conf_rule dns_conf_rule;
+extern struct dns_conf_group_info *dns_conf_current_group_info;
 
 // NOLINTNEXTLINE(bugprone-casting-through-void): offsetof result stored as void* for generic interface
 #define group_member(m) ((void *)offsetof(struct dns_conf_group, m))

@@ -28,6 +28,7 @@ int _conf_domain_rule_nameserver(const char *domain, const char *group_name)
 
 	if (strncmp(group_name, "-", sizeof("-")) != 0) {
 		group = _dns_conf_get_group_name(group_name);
+
 		if (group == NULL) {
 			goto errout;
 		}

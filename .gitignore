@@ -12,3 +12,4 @@ package/*.gz
 package/*.ipk
 target
 data/
+third_party/curl/

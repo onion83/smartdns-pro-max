@@ -1,0 +1,62 @@
+# Fully static smartdns build (musl, no dynamic dependencies)
+# Produces a single binary that runs on any Linux x86_64 system.
+#
+# Usage:
+#   docker build -f Dockerfile.static -t smartdns-static .
+#   docker create --name tmp smartdns-static
+#   docker cp tmp:/smartdns/src/smartdns ./smartdns
+#   docker rm tmp
+#
+# Multi-arch:
+#   docker build -f Dockerfile.static --platform linux/amd64 -t smartdns-static-amd64 .
+
+FROM alpine:3.19 AS builder
+
+# Build tools
+RUN apk add --no-cache \
+    build-base \
+    linux-headers \
+    musl-dev \
+    zlib-static \
+    make \
+    git \
+    curl \
+    ca-certificates \
+    perl
+
+WORKDIR /build
+
+# 1. Build static OpenSSL
+COPY third_party/build_openssl.sh /tmp/build_openssl.sh
+RUN chmod +x /tmp/build_openssl.sh && \
+    LOCAL_OPENSSL_INSTALL=/opt/openssl /tmp/build_openssl.sh && \
+    rm -f /tmp/build_openssl.sh
+
+# 2. Build static libcurl (linked against static OpenSSL)
+COPY third_party/build_curl.sh /tmp/build_curl.sh
+RUN chmod +x /tmp/build_curl.sh && \
+    LOCAL_CURL_INSTALL=/opt/curl \
+    LOCAL_OPENSSL_INSTALL=/opt/openssl \
+    /tmp/build_curl.sh && \
+    rm -f /tmp/build_curl.sh
+
+# 3. Build smartdns (fully static)
+ENV LOCAL_CURL_DIR=/opt/curl
+ENV LOCAL_OPENSSL_DIR=/opt/openssl
+ENV NO_GIT_VER=1
+
+COPY src/ /build/src/
+
+RUN cd /build/src && make clean && make STATIC=yes -j$(nproc)
+
+# Verify it's statically linked
+RUN echo "=== Binary info ===" && \
+    ls -lh /build/src/smartdns && \
+    ldd /build/src/smartdns 2>&1 || true && \
+    echo "=== Dynamic dependencies (should be 'not a dynamic executable') ==="
+
+# --- Minimal runtime image ---
+FROM scratch
+COPY --from=builder /build/src/smartdns /smartdns
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENTRYPOINT ["/smartdns"]

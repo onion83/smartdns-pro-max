@@ -140,14 +140,21 @@ void _config_domain_set_name_table_destroy(void)
 
 	hash_for_each_safe(dns_domain_set_name_table.names, i, tmp, set_name_list, node)
 	{
-		hlist_del_init(&set_name_list->node);
 		list_for_each_entry_safe(set_name, tmp1, &set_name_list->set_name_list, list)
 		{
+			if (set_name->type == DNS_DOMAIN_SET_GEOSITE) {
+				/* Keep geosite entries for hot-reload support */
+				continue;
+			}
 			list_del(&set_name->list);
 			free(set_name);
 		}
 
-		free(set_name_list);
+		/* Remove the hash entry only if all items were deleted */
+		if (list_empty(&set_name_list->set_name_list)) {
+			hlist_del_init(&set_name_list->node);
+			free(set_name_list);
+		}
 	}
 }
 

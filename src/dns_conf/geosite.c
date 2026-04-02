@@ -19,7 +19,9 @@
 #define _GNU_SOURCE
 
 #include "geosite.h"
+#include "domain_rule.h"
 #include "domain_set.h"
+#include "dns_conf_group.h"
 #include "smartdns/lib/idna.h"
 #include "smartdns/lib/stringutil.h"
 #include "smartdns/tlog.h"
@@ -36,17 +38,129 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef USE_CURL
+#include <curl/curl.h>
+#endif
+
+#ifndef SMARTDNS_VERION
+#ifdef COMMIT_VERION
+#define SMARTDNS_VERION_STR COMMIT_VERION
+#else
+#define SMARTDNS_VERION_STR "unknown"
+#endif
+#else
+#define SMARTDNS_VERION_STR SMARTDNS_VERION
+#endif
+
 struct geosite_dat_table geosite_dat_table;
 struct geosite_set_table geosite_set_table;
 
+static LIST_HEAD(geosite_domain_rule_list);
+
 #define MAX_LINE_LEN 4096
+
+/* Extract set name from "/geosite-set:NAME/" or "/domain-set:NAME/" */
+static inline const char *_geosite_extract_set_name(const char *domain)
+{
+	if (strncmp(domain, "domain-set:", sizeof("domain-set:") - 1) == 0) {
+		return domain + sizeof("domain-set:") - 1;
+	}
+	if (strncmp(domain, "geosite-set:", sizeof("geosite-set:") - 1) == 0) {
+		return domain + sizeof("geosite-set:") - 1;
+	}
+	return NULL;
+}
 
 /* Forward declaration */
 static int _geosite_dat_update(struct geosite_dat *dat);
 
+/* Domain cache management for reload diff */
+static void _domain_cache_free(struct geosite_domain_cache *cache)
+{
+	if (cache->domains) {
+		for (int i = 0; i < cache->count; i++) {
+			free(cache->domains[i]);
+		}
+		free(cache->domains);
+		cache->domains = NULL;
+	}
+	cache->count = 0;
+}
+
+static int _domain_cache_collect(const char *domain, void *priv)
+{
+	struct geosite_domain_cache *cache = (struct geosite_domain_cache *)priv;
+	if (cache->count >= GEOSITE_MAX_CACHED_DOMAINS) {
+		return 0;
+	}
+	cache->domains = realloc(cache->domains, (cache->count + 1) * sizeof(char *));
+	if (cache->domains == NULL) {
+		return -1;
+	}
+	cache->domains[cache->count] = strdup(domain);
+	if (cache->domains[cache->count] == NULL) {
+		return -1;
+	}
+	cache->count++;
+	return 0;
+}
+
+static int _domain_cache_contains(const struct geosite_domain_cache *cache, const char *domain)
+{
+	for (int i = 0; i < cache->count; i++) {
+		if (strcmp(cache->domains[i], domain) == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Check if a domain exists in a geosite file */
+static int _domain_cache_contains_file(const char *file, const char *domain)
+{
+	FILE *fp = fopen(file, "r");
+	if (fp == NULL) {
+		return 0;
+	}
+	char line[MAX_LINE_LEN];
+	char value[DNS_MAX_CNAME_LEN];
+	char normalized[DNS_MAX_CNAME_LEN];
+	while (fgets(line, MAX_LINE_LEN, fp)) {
+		char *p = line;
+		if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
+			p += 3;
+		}
+		if (sscanf(p, "%255s", value) <= 0) {
+			continue;
+		}
+		if (value[0] == '#' || value[0] == '\n' || value[0] == '\0') {
+			continue;
+		}
+		char *d_ptr = value;
+		while (*d_ptr == '.' && *(d_ptr + 1) != '\0') {
+			d_ptr++;
+		}
+		if (*d_ptr == '\0') {
+			continue;
+		}
+		if (utf8_to_punycode(d_ptr, strlen(d_ptr), normalized, sizeof(normalized)) <= 0) {
+			continue;
+		}
+		if (strcmp(normalized, domain) == 0) {
+			fclose(fp);
+			return 1;
+		}
+	}
+	fclose(fp);
+	return 0;
+}
+
 void geosite_dat_table_init(void)
 {
 	hash_init(geosite_dat_table.dats);
+#ifdef USE_CURL
+	curl_global_init(CURL_GLOBAL_DEFAULT);
+#endif
 }
 
 void geosite_set_table_init(void)
@@ -63,8 +177,13 @@ void geosite_dat_table_destroy(void)
 	hash_for_each_safe(geosite_dat_table.dats, i, tmp, dat, node)
 	{
 		hlist_del_init(&dat->node);
+		_domain_cache_free(&dat->old_domains);
 		free(dat);
 	}
+
+#ifdef USE_CURL
+	curl_global_cleanup();
+#endif
 }
 
 void geosite_set_table_destroy(void)
@@ -86,6 +205,60 @@ void geosite_set_table_destroy(void)
 		}
 		free(set);
 	}
+}
+
+void geosite_save_domain_rule(const char *set_name, int argc, char *argv[])
+{
+	/* Check for duplicate to avoid saving during replay */
+	struct geosite_domain_rule_entry *existing = NULL;
+	list_for_each_entry(existing, &geosite_domain_rule_list, list)
+	{
+		if (strcmp(existing->set_name, set_name) == 0) {
+			/* Already saved, skip */
+			return;
+		}
+	}
+
+	struct geosite_domain_rule_entry *entry = zalloc(1, sizeof(*entry));
+	if (entry == NULL) {
+		tlog(TLOG_ERROR, "geosite: failed to save domain rule for %s", set_name);
+		return;
+	}
+
+	safe_strncpy(entry->set_name, set_name, DNS_MAX_CNAME_LEN);
+
+	/* Track the current rule group where the rule will be stored.
+	 * This is determined by the -g option (if present) or the current group
+	 * at the time of parsing. During reload, we use this to ensure rules
+	 * are deleted and re-added to the same group. */
+	struct dns_conf_group *current_group = _config_current_rule_group();
+	if (current_group != NULL) {
+		safe_strncpy(entry->rule_group, current_group->group_name, sizeof(entry->rule_group));
+	}
+
+	entry->argc = argc;
+	entry->argv = zalloc(argc, sizeof(char *));
+	if (entry->argv == NULL) {
+		free(entry);
+		tlog(TLOG_ERROR, "geosite: failed to save domain rule argv for %s", set_name);
+		return;
+	}
+	for (int i = 0; i < argc; i++) {
+		entry->argv[i] = strdup(argv[i]);
+		if (entry->argv[i] == NULL) {
+			for (int j = 0; j < i; j++) {
+				free(entry->argv[j]);
+			}
+			free(entry->argv);
+			free(entry);
+			tlog(TLOG_ERROR, "geosite: failed to save domain rule argv for %s", set_name);
+			return;
+		}
+	}
+
+	list_add_tail(&entry->list, &geosite_domain_rule_list);
+	tlog(TLOG_INFO, "geosite: saved domain rule for set '%s' (argc=%d, group=%s)", set_name, argc,
+		 entry->rule_group[0] ? entry->rule_group : "(default)");
 }
 
 struct geosite_dat *geosite_dat_get(const char *name)
@@ -120,30 +293,110 @@ static int _is_url(const char *str)
 	return (strncmp(str, "http://", 7) == 0 || strncmp(str, "https://", 8) == 0);
 }
 
-/* Download file from URL using curl */
+#ifdef USE_CURL
+/* libcurl write callback: append data to FILE* */
+static size_t _curl_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	return fwrite(ptr, size, nmemb, (FILE *)userdata);
+}
+
+/* Download file from URL using libcurl */
 static int _download_file(const char *url, const char *output_path)
 {
-	char cmd[PATH_MAX * 2];
+	CURL *curl = NULL;
+	CURLcode res;
+	FILE *fp = NULL;
+	long http_code = 0;
+	char errbuf[CURL_ERROR_SIZE] = {0};
+	char dir[PATH_MAX] = {0};
+	int ret = -1;
+
+	/* Ensure output directory exists */
+	strncpy(dir, output_path, sizeof(dir) - 1);
+	char *last_slash = strrchr(dir, '/');
+	if (last_slash != NULL) {
+		*last_slash = '\0';
+		if (access(dir, F_OK) != 0) {
+			char mkdir_cmd[PATH_MAX + 32];
+			snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p '%s'", dir);
+			system(mkdir_cmd);
+		}
+	}
+
+	curl = curl_easy_init();
+	if (curl == NULL) {
+		tlog(TLOG_ERROR, "geosite: curl_easy_init failed");
+		return -1;
+	}
+
+	fp = fopen(output_path, "wb");
+	if (fp == NULL) {
+		tlog(TLOG_ERROR, "geosite: failed to create file %s: %s", output_path, strerror(errno));
+		curl_easy_cleanup(curl);
+		return -1;
+	}
+
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _curl_write_cb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, "smartdns/" SMARTDNS_VERION_STR);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+
+	tlog(TLOG_INFO, "geosite: downloading %s", url);
+	res = curl_easy_perform(curl);
+
+	if (res == CURLE_OK) {
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+		if (http_code == 200) {
+			ret = 0;
+		} else {
+			tlog(TLOG_ERROR, "geosite: download %s returned HTTP %ld", url, http_code);
+		}
+	} else {
+		tlog(TLOG_ERROR, "geosite: download %s failed: %s", url, errbuf[0] ? errbuf : curl_easy_strerror(res));
+	}
+
+	fclose(fp);
+	curl_easy_cleanup(curl);
+
+	if (ret != 0) {
+		unlink(output_path);
+	}
+
+	return ret;
+}
+#else
+/* Download file from URL using wget or curl (fallback) */
+static int _download_file(const char *url, const char *output_path)
+{
+	char cmd[PATH_MAX * 2 + 64];
 	int ret;
 
-	/* Use curl to download the file */
+	/* Try wget first, suppress stderr to avoid "not found" pollution */
 	ret = snprintf(cmd, sizeof(cmd),
-		"curl -sL --connect-timeout 10 -m 300 -o \"%s\" \"%s\"",
-		output_path, url);
-	if (ret < 0 || ret >= sizeof(cmd)) {
+		"{ wget -q --timeout=300 -O \"%s\" \"%s\" 2>/dev/null || curl -sL --connect-timeout 10 -m 300 -o \"%s\" \"%s\" 2>/dev/null; }",
+		output_path, url, output_path, url);
+	if (ret < 0 || ret >= (int)sizeof(cmd)) {
 		tlog(TLOG_ERROR, "command too long for URL: %s", url);
 		return -1;
 	}
 
-	tlog(TLOG_DEBUG, "downloading geosite from %s", url);
+	tlog(TLOG_INFO, "geosite: downloading %s", url);
 	ret = system(cmd);
 	if (ret != 0) {
-		tlog(TLOG_ERROR, "failed to download from %s, ret=%d", url, ret);
+		tlog(TLOG_ERROR, "geosite: download %s failed (wget/curl not available or network error)", url);
 		return -1;
 	}
 
 	return 0;
 }
+#endif /* USE_CURL */
 
 /* Parse a geosite list file and call callback for each domain */
 static int _parse_geosite_file(const char *file, geosite_domain_cb callback, void *priv)
@@ -215,12 +468,6 @@ static int _parse_geosite_file(const char *file, geosite_domain_cb callback, voi
 	return 0;
 }
 
-static int _update_geosite_dat_callback(const char *domain, void *priv)
-{
-	/* This callback is called during update, nothing to do here */
-	return 0;
-}
-
 static int _geosite_dat_update(struct geosite_dat *dat)
 {
 	char temp_file[DNS_MAX_PATH];
@@ -233,12 +480,38 @@ static int _geosite_dat_update(struct geosite_dat *dat)
 	int ret = 0;
 
 	if (!dat->is_url) {
-		/* For local files, just touch to update mtime */
+		/* For local files, check mtime to detect changes */
 		struct stat st;
-		if (stat(dat->file, &st) == 0) {
-			dat->last_update = st.st_mtime;
+		if (stat(dat->file, &st) != 0) {
+			tlog(TLOG_WARN, "geosite-dat %s: cannot stat file %s", dat->name, dat->file);
+			return -1;
 		}
+		if ((unsigned int)st.st_mtime == dat->last_update) {
+			/* File not modified since last check */
+			return -1;
+		}
+		tlog(TLOG_INFO, "geosite-dat %s: local file updated (old_mtime=%u, new_mtime=%u)",
+			 dat->name, dat->last_update, (unsigned int)st.st_mtime);
+		dat->last_update = st.st_mtime;
+		/*
+		 * For local files, the file has already been modified externally
+		 * when mtime changes. old_domains was cached at registration time
+		 * (or after the previous reload), so it holds the PREVIOUS file
+		 * content. This is exactly what we need for diff-based stale rule
+		 * removal — domains in old_domains but not in the new file will
+		 * have their rules deleted.
+		 * Do NOT overwrite old_domains here.
+		 */
 		return 0;
+	}
+
+	/*
+	 * For URL sources, cache current domains before downloading new file.
+	 * This allows reload to diff old vs new and remove stale rules.
+	 */
+	_domain_cache_free(&dat->old_domains);
+	if (access(dat->file, F_OK) == 0) {
+		_parse_geosite_file(dat->file, _domain_cache_collect, &dat->old_domains);
 	}
 
 	/* Create temp file for downloaded content */
@@ -251,7 +524,7 @@ static int _geosite_dat_update(struct geosite_dat *dat)
 	close(fd);
 
 	/* Download to temp file */
-	ret = _download_file(dat->file, temp_file);
+	ret = _download_file(dat->url, temp_file);
 	if (ret != 0) {
 		unlink(temp_file);
 		return ret;
@@ -353,10 +626,11 @@ int geosite_check_and_update(void)
 	struct hlist_node *tmp = NULL;
 	unsigned long i = 0;
 	unsigned int now = time(NULL);
+	int updated = 0;
 
 	hash_for_each_safe(geosite_dat_table.dats, i, tmp, dat, node)
 	{
-		if (!dat->is_url || dat->update_interval <= 0) {
+		if (dat->update_interval <= 0) {
 			continue;
 		}
 
@@ -366,8 +640,158 @@ int geosite_check_and_update(void)
 				dat->name, dat->update_interval, dat->last_update, now);
 			if (_geosite_dat_update(dat) == 0) {
 				dat->need_update = 1;
+				updated = 1;
 			}
 		}
+	}
+
+	/* If any dat was updated, reload domain rules that reference geosite-sets */
+	if (updated) {
+		struct geosite_domain_rule_entry *entry = NULL;
+		struct geosite_domain_rule_entry *tmp_entry = NULL;
+		struct dns_conf_group_info tmp_group_info;
+
+		/*
+		 * Set up a temporary group context. We'll switch to the correct group
+		 * (tracked by entry->rule_group) for each entry before delete/add.
+		 */
+		memset(&tmp_group_info, 0, sizeof(tmp_group_info));
+		tmp_group_info.rule = dns_conf_rule.default_conf;
+
+		tlog(TLOG_INFO, "geosite: %d dat(s) updated, reloading domain rules", updated);
+		list_for_each_entry_safe(entry, tmp_entry, &geosite_domain_rule_list, list)
+		{
+			tlog(TLOG_INFO, "geosite: reloading domain rules for set '%s' (argc=%d, group=%s)", entry->set_name, entry->argc,
+				 entry->rule_group[0] ? entry->rule_group : "(default)");
+
+			/*
+			 * Set the current group to match where the rule was originally added.
+			 * This ensures _config_domain_rule_delete removes from the correct group.
+			 */
+			if (entry->rule_group[0] != '\0') {
+				tmp_group_info.group_name = entry->rule_group;
+				tmp_group_info.rule = _config_rule_group_get(entry->rule_group);
+				if (tmp_group_info.rule == NULL) {
+					tmp_group_info.rule = dns_conf_rule.default_conf;
+					tlog(TLOG_WARN, "geosite: rule group '%s' not found, using default", entry->rule_group);
+				}
+			} else {
+				tmp_group_info.group_name = NULL;
+				tmp_group_info.rule = dns_conf_rule.default_conf;
+			}
+			_config_set_current_group(&tmp_group_info);
+
+			/*
+			 * Remove stale rules for updated geosite-dats.
+			 *
+			 * Strategy:
+			 * - URL sources: old_domains was cached BEFORE download, so we
+			 *   diff old vs new and only delete domains no longer in the file.
+			 * - Local files: old_domains was cached AFTER external modification,
+			 *   so it contains the current (new) content. We delete ALL cached
+			 *   domains' rules, then re-add. This correctly handles removals.
+			 */
+			/* entry->set_name is "/geosite-set:NAME/" — extract NAME */
+			const char *set_ref_name = _geosite_extract_set_name(entry->set_name);
+			if (set_ref_name == NULL) {
+				goto re_add;
+			}
+
+			uint32_t set_key = hash_string(set_ref_name);
+			struct geosite_set *set = NULL;
+			hash_for_each_possible(geosite_set_table.sets, set, node, set_key)
+			{
+				if (strcmp(set->name, set_ref_name) == 0) {
+					break;
+				}
+			}
+			if (set != NULL) {
+				struct geosite_dat *dat_ref = NULL;
+				list_for_each_entry(dat_ref, &set->dat_list, dat_list)
+				{
+					struct geosite_dat *dat = geosite_dat_get(dat_ref->name);
+					if (dat == NULL || !dat->need_update) {
+						if (dat) geosite_dat_put(dat);
+						continue;
+					}
+					geosite_dat_put(dat);
+
+					/*
+					 * Remove stale rules: old_domains holds domains from the
+					 * PREVIOUS file content (cached at registration or after
+					 * the last reload). For each cached domain, check if it
+					 * still exists in the current file. If not, delete its rule.
+					 */
+					for (int d = 0; d < dat->old_domains.count; d++) {
+						const char *old_domain = dat->old_domains.domains[d];
+						int still_exists = 0;
+						if (access(dat->file, F_OK) == 0) {
+							still_exists = _domain_cache_contains_file(dat->file, old_domain);
+						}
+						if (still_exists) {
+							continue;
+						}
+						tlog(TLOG_DEBUG, "geosite: removing stale rule for domain '%s' (dat %s)",
+							 old_domain, dat->name);
+						_config_domain_rule_delete(old_domain);
+					}
+				}
+			}
+
+		re_add:
+			/*
+			 * Re-add rules with saved argv.
+			 * getopt_long_only() permutes argv, so we must pass a copy
+			 * to preserve the original order for future reloads.
+			 */
+			{
+				char **argv_copy = calloc(entry->argc, sizeof(char *));
+				if (argv_copy != NULL) {
+					memcpy(argv_copy, entry->argv, entry->argc * sizeof(char *));
+					_config_domain_rules(NULL, entry->argc, argv_copy);
+					free(argv_copy);
+				} else {
+					tlog(TLOG_ERROR, "geosite: failed to allocate argv copy for set '%s'", entry->set_name);
+				}
+			}
+
+			tlog(TLOG_INFO, "geosite: reloaded domain rules for set '%s'", entry->set_name);
+		}
+
+		/*
+		 * After processing all entries, pop back to the base group.
+		 * We use a separate pop loop here, outside the entry iteration,
+		 * to avoid interfering with the per-entry group context.
+		 */
+		while (dns_conf_current_group_info != NULL && dns_conf_current_group_info->rule != dns_conf_rule.default_conf) {
+			_config_current_group_pop();
+		}
+		_config_set_current_group(&tmp_group_info);
+
+		/*
+		 * After all entries are processed, refresh old_domains cache for
+		 * each updated dat. This snapshot captures the current file content
+		 * so that the NEXT file modification can be correctly diffed against
+		 * the domains whose rules are currently active in the ART tree.
+		 */
+		hash_for_each_safe(geosite_dat_table.dats, i, tmp, dat, node)
+		{
+			if (!dat->need_update) {
+				continue;
+			}
+			dat->need_update = 0;
+			_domain_cache_free(&dat->old_domains);
+			if (access(dat->file, F_OK) == 0) {
+				_parse_geosite_file(dat->file, _domain_cache_collect, &dat->old_domains);
+			}
+			tlog(TLOG_INFO, "geosite: refreshed domain cache for dat '%s' (%d domains)",
+				 dat->name, dat->old_domains.count);
+		}
+
+		/* Restore dns_conf_current_group_info to NULL.
+		 * _config_set_current_group(NULL) is a no-op (returns immediately),
+		 * so we must clear the pointer directly. */
+		dns_conf_current_group_info = NULL;
 	}
 
 	return 0;
@@ -534,29 +958,7 @@ int _config_geosite_dat(void *data, int argc, char *argv[])
 	dat->last_update = 0;
 	dat->need_update = 0;
 
-	if (dat->is_url) {
-		/* For URL, construct the local cache file path */
-		/* Use data directory or a default location */
-		const char *data_dir = dns_conf_get_data_dir();
-		char cache_file[DNS_MAX_PATH];
-		snprintf(cache_file, sizeof(cache_file), "%s/geosite-%s.list", data_dir, name);
-		conf_get_conf_fullpath(cache_file, dat->file, DNS_MAX_PATH);
-
-		/* Download if local file doesn't exist */
-		if (access(dat->file, F_OK) != 0) {
-			tlog(TLOG_INFO, "geosite-dat %s: downloading from %s", name, file);
-			if (_download_file(file, dat->file) == 0) {
-				dat->last_update = time(NULL);
-			} else {
-				tlog(TLOG_ERROR, "geosite-dat %s: initial download failed.", name);
-				free(dat);
-				return -1;
-			}
-		}
-
-		/* Store the URL for future updates */
-		safe_strncpy(file, argv[2], DNS_MAX_PATH); /* Keep original URL */
-	} else {
+	if (!dat->is_url) {
 		/* Local file */
 		conf_get_conf_fullpath(file, dat->file, DNS_MAX_PATH);
 
@@ -566,14 +968,47 @@ int _config_geosite_dat(void *data, int argc, char *argv[])
 			free(dat);
 			return -1;
 		}
+
+		/* Record initial mtime for local files */
+		struct stat st;
+		if (stat(dat->file, &st) == 0) {
+			dat->last_update = st.st_mtime;
+		}
+
+		/*
+		 * Cache initial domain list for local files.
+		 * This snapshot captures the domains that will be loaded into ART rules
+		 * during the upcoming config parse. When the file is later modified
+		 * externally, this cache serves as the "old" domain list for diffing,
+		 * allowing us to detect and remove rules for deleted domains.
+		 */
+		_parse_geosite_file(dat->file, _domain_cache_collect, &dat->old_domains);
+	} else {
+		/* For URL, construct the local cache file path */
+		/* Use data directory or a default location */
+		const char *data_dir = dns_conf_get_data_dir();
+		char cache_file[DNS_MAX_PATH];
+		snprintf(cache_file, sizeof(cache_file), "%s/geosite-%s.list", data_dir, name);
+		conf_get_conf_fullpath(cache_file, dat->file, DNS_MAX_PATH);
+
+		/* Store the original URL */
+		safe_strncpy(dat->url, argv[2], DNS_MAX_PATH);
+
+		/* Download if local file doesn't exist */
+		if (access(dat->file, F_OK) != 0) {
+			tlog(TLOG_INFO, "geosite-dat %s: downloading from %s", name, dat->url);
+			if (_download_file(dat->url, dat->file) == 0) {
+				dat->last_update = time(NULL);
+			} else {
+				tlog(TLOG_WARN, "geosite-dat %s: initial download failed, will retry later.", name);
+			}
+		}
 	}
 
 	hash_add(geosite_dat_table.dats, &dat->node, key);
 
-	tlog(TLOG_INFO, "geosite-dat %s registered: file=%s, interval=%d, is_url=%d",
-		dat->name, dat->file, dat->update_interval, dat->is_url);
-
-	(void)file; /* suppress unused warning */
+	tlog(TLOG_INFO, "geosite-dat %s registered: file=%s, url=%s, interval=%d, is_url=%d",
+		dat->name, dat->file, dat->url, dat->update_interval, dat->is_url);
 
 	return 0;
 }

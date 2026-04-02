@@ -23,6 +23,38 @@ LINT_OBJS=$(filter-out lib/%.o, $(OBJS))
 TEST_OBJS=$(patsubst %.o,%_test.o,$(OBJS))
 MAIN_OBJ = main.o
 
+# libcurl: prefer locally built static lib, fallback to system
+LOCAL_CURL_DIR ?= ../third_party/curl/install
+LOCAL_CURL_LIB := $(shell ls $(LOCAL_CURL_DIR)/lib/libcurl.a 2>/dev/null)
+ifdef LOCAL_CURL_LIB
+  CURL_CFLAGS := -DUSE_CURL -I$(LOCAL_CURL_DIR)/include
+  CURL_LDFLAGS := $(LOCAL_CURL_LIB)
+  $(info Using local libcurl: $(LOCAL_CURL_LIB))
+else
+  HAS_SYSTEM_CURL := $(shell curl-config --libs 2>/dev/null)
+  ifdef HAS_SYSTEM_CURL
+    CURL_CFLAGS := -DUSE_CURL $(shell curl-config --cflags 2>/dev/null)
+    CURL_LDFLAGS := -lcurl
+    $(info Using system libcurl)
+  else
+    CURL_CFLAGS :=
+    CURL_LDFLAGS :=
+    $(warning libcurl not found, geosite URL download will be disabled)
+  endif
+endif
+
+# Static OpenSSL (for fully static builds with musl)
+LOCAL_OPENSSL_DIR ?= ../third_party/openssl/install
+LOCAL_OPENSSL_LIB := $(shell ls $(LOCAL_OPENSSL_DIR)/lib/libssl.a 2>/dev/null)
+ifdef LOCAL_OPENSSL_LIB
+  override CFLAGS += -I$(LOCAL_OPENSSL_DIR)/include
+  ifdef STATIC
+    # In static mode, link against static OpenSSL instead of system -lssl/-lcrypto
+    SSL_LDFLAGS := $(LOCAL_OPENSSL_LIB) $(LOCAL_OPENSSL_DIR)/lib/libcrypto.a
+    $(info Using local static OpenSSL: $(LOCAL_OPENSSL_LIB))
+  endif
+endif
+
 ifeq ($(filter -j,$(MAKEFLAGS)),)
 MAKEFLAGS += -j$(shell nproc)
 endif
@@ -51,6 +83,9 @@ ifdef VER
  override CFLAGS += -DSMARTDNS_VERION='"$(VER)"'
 endif
 
+override CFLAGS += $(CURL_CFLAGS)
+override LDFLAGS += $(CURL_LDFLAGS)
+
 HAS_GIT := $(shell command -v git 2> /dev/null)
 ifndef NO_GIT_VER
  ifdef HAS_GIT
@@ -74,7 +109,11 @@ endif
 
 ifdef STATIC
  override CFLAGS += -DBUILD_STATIC
- override LDFLAGS += -lssl -lcrypto -Wl,--whole-archive -lpthread -Wl,--no-whole-archive -ldl -lm -static -rdynamic
+ ifdef SSL_LDFLAGS
+  override LDFLAGS += $(SSL_LDFLAGS) -Wl,--whole-archive -lpthread -Wl,--no-whole-archive -ldl -lm -lz -static -rdynamic
+ else
+  override LDFLAGS += -lssl -lcrypto -Wl,--whole-archive -lpthread -Wl,--no-whole-archive -ldl -lm -lz -static -rdynamic
+ endif
 else
  override LDFLAGS += -lssl -lcrypto -lpthread -ldl -lm -rdynamic
 endif
@@ -87,9 +126,13 @@ endif
 
 override LDFLAGS += $(EXTRA_LDFLAGS)
 
-.PHONY: all clean
+.PHONY: all clean build-curl
 
 all: $(BIN)
+
+build-curl:
+	@echo "Building libcurl static library..."
+	../third_party/build_curl.sh
 
 %_test.o: %.c
 	$(CC) -DTEST $(CFLAGS) -c $< -o $@

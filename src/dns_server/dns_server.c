@@ -667,7 +667,7 @@ static void _dns_server_period_run_second(void)
 		dns_server_check_ipv6_ready();
 	}
 
-	if (sec % 60 == 0) {
+	if (sec % 5 == 0) {
 		if (dns_server_check_update_hosts() == 0) {
 			tlog(TLOG_INFO, "Update host file data");
 		}

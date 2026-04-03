@@ -228,6 +228,7 @@ static struct config_item _config_item[] = {
 	CONF_CUSTOM("bogus-nxdomain", _config_bogus_nxdomain, NULL),
 	CONF_CUSTOM("ignore-ip", _config_ip_ignore, NULL),
 	CONF_CUSTOM("edns-client-subnet", _conf_edns_client_subnet, NULL),
+	CONF_CUSTOM("geosite-updater", _config_geosite_updater, NULL),
 	CONF_CUSTOM("geosite-dat", _config_geosite_dat, NULL),
 	CONF_CUSTOM("geosite-set", _config_geosite_set, NULL),
 	CONF_CUSTOM("domain-set", _config_domain_set, NULL),

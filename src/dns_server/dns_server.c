@@ -671,7 +671,7 @@ static void _dns_server_period_run_second(void)
 		if (dns_server_check_update_hosts() == 0) {
 			tlog(TLOG_INFO, "Update host file data");
 		}
-		geosite_check_and_update();
+		geosite_check_and_download();
 	}
 
 	_dns_server_save_cache_to_file();
@@ -788,6 +788,16 @@ int dns_server_run(void)
 				_dns_server_process_local_addr_cache(event->data.fd, event, now);
 				continue;
 			}
+
+#ifdef __linux__
+			if (unlikely(event->data.fd == geosite_get_download_event_fd())) {
+				uint64_t value;
+				int unused __attribute__((unused));
+				unused = read(geosite_get_download_event_fd(), &value, sizeof(uint64_t));
+				geosite_reload_rules();
+				continue;
+			}
+#endif
 
 			struct dns_server_conn_head *conn_head = event->data.ptr;
 			if (conn_head == NULL) {
@@ -915,6 +925,24 @@ int dns_server_init(void)
 		tlog(TLOG_ERROR, "init wakeup event failed.");
 		goto errout;
 	}
+
+	if (geosite_download_event_init() != 0) {
+		tlog(TLOG_WARN, "init geosite download event failed.");
+	}
+	geosite_log_config_summary();
+#ifdef __linux__
+	/* Register geosite download eventfd to epoll */
+	int geosite_efd = geosite_get_download_event_fd();
+	if (geosite_efd >= 0) {
+		struct epoll_event gevt;
+		memset(&gevt, 0, sizeof(gevt));
+		gevt.events = EPOLLIN | EPOLLERR;
+		gevt.data.fd = geosite_efd;
+		if (epoll_ctl(server.epoll_fd, EPOLL_CTL_ADD, geosite_efd, &gevt) != 0) {
+			tlog(TLOG_WARN, "register geosite eventfd to epoll failed: %s", strerror(errno));
+		}
+	}
+#endif
 
 	if (_dns_server_cache_init() != 0) {
 		tlog(TLOG_ERROR, "init dns cache filed.");

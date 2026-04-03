@@ -25,10 +25,29 @@
 extern "C" {
 #endif /*__cplusplus */
 
-#define GEOSITE_DEFAULT_UPDATE_INTERVAL 5
+#define GEOSITE_DEFAULT_UPDATE_INTERVAL 300
 
 /* Maximum cached domains per geosite-dat (for reload diff) */
 #define GEOSITE_MAX_CACHED_DOMAINS 65536
+
+/* Diff algorithms for detecting file changes */
+enum geosite_diff_algo {
+	GEOSITE_DIFF_MTIME = 0,
+	GEOSITE_DIFF_CRC32,
+	GEOSITE_DIFF_MD5,
+};
+
+/* geosite-updater configuration */
+struct geosite_updater_config {
+	int default_interval;                     /* default update interval (seconds) */
+	enum geosite_diff_algo diff_algo;         /* file change detection algorithm */
+	int use_etag;                             /* 1 = use HTTP ETag for URL updates */
+	char user_agent[256];                     /* HTTP User-Agent for downloads */
+	char data_dir[DNS_MAX_PATH];              /* directory for URL-downloaded files */
+	int http_timeout;                         /* HTTP download timeout in seconds */
+	int http_retry;                           /* HTTP download retry count */
+	int http_retry_interval;                  /* seconds to wait between retries (default 3) */
+};
 
 /* Cached domain list for reload diff */
 struct geosite_domain_cache {
@@ -43,11 +62,15 @@ struct geosite_dat {
 	char file[DNS_MAX_PATH];           /* local file path */
 	char url[DNS_MAX_PATH];            /* original URL (only if is_url == 1) */
 	int update_interval;               /* update interval in seconds, 0 means no update */
-	unsigned int last_update;           /* last update timestamp */
+	unsigned int last_update;           /* last update timestamp (or mtime for local files) */
 	atomic_t refcnt;                   /* reference count */
 	int is_url;                        /* 1 if source is a URL */
 	int need_update;                   /* flag indicating update is needed */
+	int downloading;                   /* 1 if download is in progress */
+	char etag[128];                    /* last HTTP ETag for URL sources */
+	char file_hash[33];                /* CRC32 (8 hex) or MD5 (32 hex) hash */
 	struct geosite_domain_cache old_domains; /* cached domains before last update */
+	struct geosite_domain_cache new_domains; /* pre-loaded domains from current file (for reload diff) */
 };
 
 /* Saved domain-rules for reload on geosite data update */
@@ -88,6 +111,12 @@ int _config_geosite_dat(void *data, int argc, char *argv[]);
 /* Config parser for geosite-set directive */
 int _config_geosite_set(void *data, int argc, char *argv[]);
 
+/* Config parser for geosite-updater directive */
+int _config_geosite_updater(void *data, int argc, char *argv[]);
+
+/* Get the global geosite updater config */
+const struct geosite_updater_config *geosite_get_updater_config(void);
+
 /* Domain iteration callback for geosite */
 typedef int (*geosite_domain_cb)(const char *domain, void *priv);
 
@@ -97,8 +126,26 @@ int geosite_set_foreach_domain(const char *set_name, geosite_domain_cb callback,
 /* Iterate domains in a single geosite-dat */
 int geosite_dat_foreach_domain(const char *dat_name, geosite_domain_cb callback, void *priv);
 
-/* Check and update geosite data if needed */
-int geosite_check_and_update(void);
+/* Check and update geosite data if needed (non-blocking, triggers async download) */
+int geosite_check_and_download(void);
+
+/* Reload geosite rules into ART tree (called on main thread after download completes) */
+int geosite_reload_rules(void);
+
+/* Get the eventfd for async download notification */
+int geosite_get_download_event_fd(void);
+
+/* Initialize async download eventfd */
+int geosite_download_event_init(void);
+
+/* Destroy async download eventfd */
+void geosite_download_event_destroy(void);
+
+/* Get geosite feature build version string, e.g. "geosite(260403-1322)" */
+const char *geosite_build_version(void);
+
+/* Log geosite configuration summary (call after tlog_init) */
+void geosite_log_config_summary(void);
 
 /* Get geosite dat by name */
 struct geosite_dat *geosite_dat_get(const char *name);

@@ -50,6 +50,7 @@ int _config_rule_group_init(void);
 void _config_rule_group_destroy(void);
 
 struct dns_conf_group *_config_rule_group_new(const char *group_name);
+struct dns_conf_group *_config_rule_group_get(const char *group_name);
 
 struct dns_conf_group *_config_current_rule_group(void);
 struct dns_conf_group_info *_config_current_group(void);

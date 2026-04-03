@@ -174,6 +174,12 @@ void dns_cache_data_put(struct dns_cache_data *cache_data);
 
 void dns_cache_flush(void);
 
+/* Remove all cache entries whose domain matches the given suffix.
+ * For example, domain_suffix="google.com" will remove cache for
+ * "google.com", "www.google.com", "mail.google.com", etc.
+ * If removed_count is not NULL, the number of removed entries is stored there. */
+int dns_cache_remove_by_suffix(const char *domain_suffix, int *removed_count);
+
 void dns_cache_destroy(void);
 
 int dns_cache_load(const char *file);

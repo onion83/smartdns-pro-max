@@ -20,6 +20,7 @@
 
 #include "smartdns/smartdns.h"
 
+#include "dns_conf/geosite.h"
 #include "smartdns/lib/art.h"
 #include "smartdns/lib/atomic.h"
 #include "smartdns/lib/hashtable.h"
@@ -95,12 +96,12 @@ static void _help(void)
 static void _smartdns_get_version(char *str_ver, int str_ver_len)
 {
 	char commit_ver[TMP_BUFF_LEN_32 * 2] = {0};
-#ifdef COMMIT_VERION
-	snprintf(commit_ver, sizeof(commit_ver), " (%s)", COMMIT_VERION);
+#ifdef COMMIT_VERSION
+	snprintf(commit_ver, sizeof(commit_ver), " (%s_%s)", COMMIT_VERSION, geosite_build_version());
 #endif
 
-#ifdef SMARTDNS_VERION
-	const char *ver = SMARTDNS_VERION;
+#ifdef SMARTDNS_VERSION
+	const char *ver = SMARTDNS_VERSION;
 	snprintf(str_ver, str_ver_len, "%s%s", ver, commit_ver);
 #else
 	struct tm tm;
@@ -737,8 +738,8 @@ static void _sig_error_exit(int signo, siginfo_t *siginfo, void *ct)
 	ucontext_t *context = ct;
 	const char *arch = NULL;
 	const char *build_info = "";
-#ifdef SMARTDNS_VERION
-	build_info = SMARTDNS_VERION;
+#ifdef SMARTDNS_VERSION
+	build_info = SMARTDNS_VERSION;
 #else
 	build_info = __DATE__ " " __TIME__;
 #endif

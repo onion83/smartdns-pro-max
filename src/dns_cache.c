@@ -571,6 +571,41 @@ void dns_cache_flush(void)
 	pthread_mutex_unlock(&dns_cache_head.lock);
 }
 
+int dns_cache_remove_by_suffix(const char *domain_suffix, int *removed_count)
+{
+	struct dns_cache *dns_cache = NULL;
+	struct dns_cache *tmp = NULL;
+	int count = 0;
+	size_t slen;
+
+	if (domain_suffix == NULL || domain_suffix[0] == '\0') {
+		return 0;
+	}
+
+	slen = strlen(domain_suffix);
+
+	pthread_mutex_lock(&dns_cache_head.lock);
+	list_for_each_entry_safe(dns_cache, tmp, &dns_cache_head.cache_list, list)
+	{
+		size_t dlen = strlen(dns_cache->info.domain);
+		/* Check if cache domain ends with the given suffix */
+		if (dlen >= slen &&
+			strncasecmp(dns_cache->info.domain + dlen - slen, domain_suffix, slen) == 0) {
+			/* Ensure it's a proper suffix match (dot boundary or exact match) */
+			if (dlen == slen || dns_cache->info.domain[dlen - slen - 1] == '.') {
+				_dns_cache_remove(dns_cache);
+				count++;
+			}
+		}
+	}
+	pthread_mutex_unlock(&dns_cache_head.lock);
+
+	if (removed_count) {
+		*removed_count = count;
+	}
+	return 0;
+}
+
 void dns_cache_data_put(struct dns_cache_data *cache_data)
 {
 	if (cache_data == NULL) {

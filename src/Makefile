@@ -80,7 +80,7 @@ override CFLAGS += -DBASE_FILE_NAME='"$(notdir $<)"'
 override CFLAGS += $(EXTRA_CFLAGS)
 
 ifdef VER
- override CFLAGS += -DSMARTDNS_VERION='"$(VER)"'
+ override CFLAGS += -DSMARTDNS_VERSION='"$(VER)"'
 endif
 
 override CFLAGS += $(CURL_CFLAGS)
@@ -91,13 +91,13 @@ ifndef NO_GIT_VER
  ifdef HAS_GIT
   IS_GIT_REPO := $(shell git rev-parse --is-inside-work-tree 2>/dev/null)
   ifdef IS_GIT_REPO
-   override COMMIT_VERION = $(shell git describe --tags --always --dirty)
+   override COMMIT_VERSION = $(shell git describe --tags --always --dirty)
   endif
  endif
 endif
 
-ifdef COMMIT_VERION
- override CFLAGS += -DCOMMIT_VERION='"$(shell git describe --tags --always --dirty)"'
+ifdef COMMIT_VERSION
+ override CFLAGS += -DCOMMIT_VERSION='"$(shell git describe --tags --always --dirty)"'
 endif
 
 CXXFLAGS=-O2 -g -Wall -std=c++11 

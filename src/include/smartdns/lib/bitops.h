@@ -93,12 +93,22 @@ static inline unsigned long __ffs(unsigned long word)
 	return num;
 }
 
-static inline int fls(int x)
+static inline int fls_generic(int x)
 {
 	if (x == 0)
 		return 0;
 	return 32 - __builtin_clz(x);
 }
+
+/* Avoid conflict with macOS system fls() */
+#ifndef __APPLE__
+static inline int fls(int x)
+{
+	return fls_generic(x);
+}
+#else
+#define fls(x) fls_generic(x)
+#endif
 
 /**
  * fls64 - find last set bit in a 64-bit word

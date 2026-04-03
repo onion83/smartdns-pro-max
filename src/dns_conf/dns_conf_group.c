@@ -141,6 +141,46 @@ struct dns_conf_group *_config_current_rule_group(void)
 	return dns_conf_current_group_info->rule;
 }
 
+void _config_set_current_rule_group(struct dns_conf_group *rule)
+{
+	if (dns_conf_current_group_info != NULL) {
+		dns_conf_current_group_info->rule = rule;
+	}
+}
+
+/* Push a heap-allocated temporary group_info onto the group stack.
+ * After config parsing, dns_conf_current_group_info may be NULL (cleaned up
+ * by _config_current_group_pop_all). These functions allow geosite reload
+ * to temporarily set a rule group without needing a live group_info on the
+ * stack. The caller must pair each push with exactly one pop. */
+struct dns_conf_group_info *_config_push_temp_rule_group(struct dns_conf_group *rule)
+{
+	struct dns_conf_group_info *gi = zalloc(1, sizeof(*gi));
+	if (gi == NULL) {
+		return NULL;
+	}
+	INIT_LIST_HEAD(&gi->list);
+	gi->rule = rule;
+	list_add_tail(&gi->list, &dns_conf_group_info_list);
+	dns_conf_current_group_info = gi;
+	return gi;
+}
+
+void _config_pop_temp_rule_group(struct dns_conf_group_info *gi)
+{
+	if (gi == NULL) {
+		return;
+	}
+	list_del(&gi->list);
+	free(gi);
+	/* Restore current to the new list tail, or NULL if empty */
+	if (list_empty(&dns_conf_group_info_list)) {
+		dns_conf_current_group_info = NULL;
+	} else {
+		dns_conf_current_group_info = list_last_entry(&dns_conf_group_info_list, struct dns_conf_group_info, list);
+	}
+}
+
 struct dns_conf_group_info *_config_current_group(void)
 {
 	return dns_conf_current_group_info;

@@ -53,6 +53,9 @@ struct dns_conf_group *_config_rule_group_new(const char *group_name);
 struct dns_conf_group *_config_rule_group_get(const char *group_name);
 
 struct dns_conf_group *_config_current_rule_group(void);
+void _config_set_current_rule_group(struct dns_conf_group *rule);
+struct dns_conf_group_info *_config_push_temp_rule_group(struct dns_conf_group *rule);
+void _config_pop_temp_rule_group(struct dns_conf_group_info *gi);
 struct dns_conf_group_info *_config_current_group(void);
 struct dns_conf_group_info *_config_default_group(void);
 void _config_set_current_group(struct dns_conf_group_info *group_info);

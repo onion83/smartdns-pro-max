@@ -48,6 +48,7 @@
 #include <curl/curl.h>
 #endif
 
+
 #ifndef SMARTDNS_VERSION
 #ifdef COMMIT_VERSION
 #define SMARTDNS_VERSION_STR COMMIT_VERSION
@@ -72,6 +73,22 @@ const char *geosite_build_version(void)
 		snprintf(ver, sizeof(ver), "geosite-mod-%.4d%.2d%.2d%.2d%.2d", year, month + 1, day, hour, min);
 	}
 	return ver;
+}
+
+/* Log libcurl and libssl versions with static/dynamic linkage info */
+static void _geosite_log_lib_versions(void)
+{
+#ifdef USE_CURL
+	tlog(TLOG_NOTICE, "geosite: %s (%s)", curl_version(),
+#ifdef USE_CURL_STATIC
+		"static"
+#else
+		"dynamic"
+#endif
+	);
+#else
+	tlog(TLOG_NOTICE, "geosite: libcurl not available");
+#endif
 }
 
 struct geosite_dat_table geosite_dat_table;
@@ -517,7 +534,8 @@ void geosite_log_config_summary(void)
 		return;
 	}
 
-	tlog(TLOG_NOTICE, "geosite feature %s", geosite_build_version());
+	tlog(TLOG_NOTICE, "geosite MOD: %s", geosite_build_version());
+	_geosite_log_lib_versions();
 
 	tlog(TLOG_NOTICE,
 		"geosite: %d dat source(s) (%d local, %d url), %d set rule(s), interval=%d, diff_algo=%s",
@@ -991,7 +1009,7 @@ static int _parse_geosite_file(const char *file, geosite_domain_cb callback, voi
 
 		/* Convert to punycode if needed */
 		if (utf8_to_punycode(d_ptr, strlen(d_ptr), domain, sizeof(domain)) <= 0) {
-			tlog(TLOG_WARN, "process geosite file %s failed at line %d, invalid domain %s.", file, line_no, d_ptr);
+			tlog(TLOG_WARN, "process geosite file %s: skip invalid domain at line %d (punycode failed: %s).", file, line_no, d_ptr);
 			continue;
 		}
 
@@ -1507,31 +1525,51 @@ int geosite_reload_rules(void)
 
 	struct geosite_domain_rule_entry *entry = NULL;
 	struct geosite_domain_rule_entry *tmp_entry = NULL;
-	struct dns_conf_group_info tmp_group_info;
 	int total_deleted = 0;
 	int total_added = 0;
 
-	memset(&tmp_group_info, 0, sizeof(tmp_group_info));
-	tmp_group_info.rule = dns_conf_rule.default_conf;
+	/* Collect changed dat names for log message */
+	char changed_names[256] = {0};
+	int changed_names_len = 0;
+	hash_for_each_safe(geosite_dat_table.dats, i, tmp, dat, node)
+	{
+		if (!dat->need_update) {
+			continue;
+		}
+		if (changed_names_len > 0 && changed_names_len < (int)sizeof(changed_names) - 3) {
+			changed_names_len += snprintf(changed_names + changed_names_len, sizeof(changed_names) - changed_names_len, ", ");
+		}
+		changed_names_len += snprintf(changed_names + changed_names_len, sizeof(changed_names) - changed_names_len, "%s", dat->name);
+	}
 
-	tlog(TLOG_INFO, "geosite: reloading domain rules (async update)");
+	const char *algo_name = (geosite_updater.diff_algo == GEOSITE_DIFF_CRC32) ? "crc32" :
+	                        (geosite_updater.diff_algo == GEOSITE_DIFF_MD5)   ? "md5" : "mtime";
+	tlog(TLOG_INFO, "geosite: %s changed (%s), reloading domain rules", changed_names, algo_name);
 	list_for_each_entry_safe(entry, tmp_entry, &geosite_domain_rule_list, list)
 	{
 		tlog(TLOG_DEBUG, "geosite: reloading rules for set '%s' (argc=%d, group=%s)",
 			 entry->set_name, entry->argc, entry->rule_group[0] ? entry->rule_group : "(default)");
 
+		/*
+		 * After config parsing, dns_conf_current_group_info is NULL
+		 * (cleaned up by _config_current_group_pop_all in _dns_conf_load_post).
+		 * We push a heap-allocated temp group_info so that
+		 * _config_current_rule_group() returns the correct target rule.
+		 * The temp group_info is properly freed after _config_domain_rules returns.
+		 */
+		struct dns_conf_group *target_rule = dns_conf_rule.default_conf;
 		if (entry->rule_group[0] != '\0') {
-			tmp_group_info.group_name = entry->rule_group;
-			tmp_group_info.rule = _config_rule_group_get(entry->rule_group);
-			if (tmp_group_info.rule == NULL) {
-				tmp_group_info.rule = dns_conf_rule.default_conf;
+			target_rule = _config_rule_group_get(entry->rule_group);
+			if (target_rule == NULL) {
+				target_rule = dns_conf_rule.default_conf;
 				tlog(TLOG_WARN, "geosite: rule group '%s' not found, using default", entry->rule_group);
 			}
-		} else {
-			tmp_group_info.group_name = NULL;
-			tmp_group_info.rule = dns_conf_rule.default_conf;
 		}
-		_config_set_current_group(&tmp_group_info);
+		struct dns_conf_group_info *tmp_group = _config_push_temp_rule_group(target_rule);
+		if (tmp_group == NULL) {
+			tlog(TLOG_ERROR, "geosite: failed to push temp rule group for set '%s'", entry->set_name);
+			continue;
+		}
 
 		const char *set_ref_name = _geosite_extract_set_name(entry->set_name);
 		if (set_ref_name == NULL) {
@@ -1585,10 +1623,12 @@ int geosite_reload_rules(void)
 		}
 
 		tlog(TLOG_DEBUG, "geosite: reloaded rules for set '%s'", entry->set_name);
+
+		/* Pop the temp group_info, restoring group stack state */
+		_config_pop_temp_rule_group(tmp_group);
 	}
 
-	/* Restore group stack to its original state before reload */
-	_config_current_group_pop_to_default();
+	/* Group stack is restored to NULL (post-config-parsing state) */
 
 	hash_for_each_safe(geosite_dat_table.dats, i, tmp, dat, node)
 	{

@@ -654,6 +654,11 @@ int _config_domain_rule_add(const char *domain, enum domain_rule type, void *rul
 
 	struct dns_conf_group *rg = _config_current_rule_group();
 
+	if (rg == NULL) {
+		tlog(TLOG_ERROR, "BUG: _config_current_rule_group() returned NULL for domain %s type %d", domain, type);
+		goto errout;
+	}
+
 	/* Get existing domain rule */
 	domain_rule = art_search(&rg->domain_rule.tree, (unsigned char *)domain_key, len);
 

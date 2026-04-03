@@ -27,7 +27,7 @@ MAIN_OBJ = main.o
 LOCAL_CURL_DIR ?= ../third_party/curl/install
 LOCAL_CURL_LIB := $(shell ls $(LOCAL_CURL_DIR)/lib/libcurl.a 2>/dev/null)
 ifdef LOCAL_CURL_LIB
-  CURL_CFLAGS := -DUSE_CURL -I$(LOCAL_CURL_DIR)/include
+  CURL_CFLAGS := -DUSE_CURL -DUSE_CURL_STATIC -I$(LOCAL_CURL_DIR)/include
   CURL_LDFLAGS := $(LOCAL_CURL_LIB)
   $(info Using local libcurl: $(LOCAL_CURL_LIB))
 else

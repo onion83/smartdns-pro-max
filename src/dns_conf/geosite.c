@@ -779,8 +779,7 @@ static int _download_file(const char *url, const char *output_path, const char *
 	if (res == CURLE_OK) {
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 		if (http_code == 304) {
-			/* Not Modified — content unchanged */
-			tlog(TLOG_DEBUG, "geosite: %s not modified (304)", url);
+			/* Not Modified — caller will log with diff-algo info */
 			fclose(fp);
 			unlink(output_path);
 			curl_easy_cleanup(curl);
@@ -1085,190 +1084,179 @@ struct geosite_download_arg {
 	int is_url;
 };
 
+/* Download and normalize a single URL geosite-dat.
+ *
+ * Common core used by both:
+ *   - _geosite_download_thread()  [async background]
+ *   - geosite_download_url_files_sync()  [synchronous for --check-domain-rule]
+ *
+ * Parameters:
+ *   dat       - geosite_dat to download (must be is_url==1)
+ *   out_etag  - [out] new ETag from server response (128 bytes)
+ *
+ * Returns:
+ *    0 = success (file downloaded, normalized, renamed)
+ *    1 = not modified (304 Not Modified)
+ *   -1 = error (download failed or normalize failed)
+ */
+static int _geosite_download_one_url(struct geosite_dat *dat, char *out_etag)
+{
+	int ret = -1;
+	char temp_file[DNS_MAX_PATH];
+	int domain_count = 0;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+	snprintf(temp_file, sizeof(temp_file), "%s.XXXXXX", dat->file);
+	temp_file[sizeof(temp_file) - 8] = '\0';
+#pragma GCC diagnostic pop
+
+	int fd = mkstemp(temp_file);
+	if (fd < 0) {
+		tlog(TLOG_ERROR, "geosite-dat %s: create temp file failed: %s", dat->name, strerror(errno));
+		return -1;
+	}
+	close(fd);
+
+	/* Download with ETag support, retry on failure */
+	int retry = 0;
+	for (retry = 0; retry <= geosite_updater.http_retry; retry++) {
+		ret = _download_file(dat->url, temp_file, dat->etag, out_etag);
+		if (ret >= 0 || retry >= geosite_updater.http_retry) {
+			break;
+		}
+		tlog(TLOG_WARN, "geosite-dat %s: download failed, retry %d/%d",
+			 dat->name, retry + 1, geosite_updater.http_retry);
+		sleep(geosite_updater.http_retry_interval);
+	}
+
+	if (ret == 1) {
+		unlink(temp_file);
+		const char *algo_name = (geosite_updater.diff_algo == GEOSITE_DIFF_CRC32) ? "crc32" :
+		                        (geosite_updater.diff_algo == GEOSITE_DIFF_MD5)   ? "md5" : "mtime";
+		tlog(TLOG_DEBUG, "geosite-dat %s: content not changed (ETag 304, skipped %s check)",
+			 dat->name, algo_name);
+		return 1; /* 304 Not Modified */
+	}
+	if (ret != 0) {
+		unlink(temp_file);
+		return -1; /* download failed */
+	}
+
+	/* Normalize: parse downloaded file and rewrite with validated domains */
+	FILE *fp_in = fopen(temp_file, "r");
+	if (fp_in == NULL) {
+		tlog(TLOG_ERROR, "geosite-dat %s: open temp file failed: %s", dat->name, strerror(errno));
+		unlink(temp_file);
+		return -1;
+	}
+
+	char out_file[DNS_MAX_PATH + 4]; /* extra 4 for ".new" suffix */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+	snprintf(out_file, sizeof(out_file), "%s.new", dat->file);
+#pragma GCC diagnostic pop
+	out_file[sizeof(out_file) - 5] = '\0';
+
+	FILE *fp_out = fopen(out_file, "w");
+	if (fp_out == NULL) {
+		tlog(TLOG_ERROR, "geosite-dat %s: create output file failed: %s", dat->name, strerror(errno));
+		fclose(fp_in);
+		unlink(temp_file);
+		return -1;
+	}
+
+	char line[MAX_LINE_LEN];
+	char value[DNS_MAX_CNAME_LEN];
+	int line_no = 0;
+	while (fgets(line, MAX_LINE_LEN, fp_in)) {
+		char *p = line;
+		line_no++;
+		/* skip UTF-8 BOM */
+		if (line_no == 1 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB &&
+			(unsigned char)line[2] == 0xBF) {
+			p += 3;
+		}
+		int filed_num = sscanf(p, "%255s", value);
+		if (filed_num <= 0) {
+			continue;
+		}
+		if (value[0] == '#' || value[0] == '\n' || value[0] == '\0') {
+			fprintf(fp_out, "%s", line);
+			continue;
+		}
+		char domain[DNS_MAX_CNAME_LEN];
+		char *d_ptr = value;
+		while (*d_ptr == '.') {
+			if (*(d_ptr + 1) == '\0') break;
+			d_ptr++;
+		}
+		if (*d_ptr == '\0') {
+			fprintf(fp_out, "%s", line);
+			continue;
+		}
+		if (utf8_to_punycode(d_ptr, strlen(d_ptr), domain, sizeof(domain)) <= 0) {
+			fprintf(fp_out, "%s", line);
+			continue;
+		}
+		if (!_is_valid_domain(domain)) {
+			continue;
+		}
+		fprintf(fp_out, "%s\n", domain);
+		domain_count++;
+	}
+
+	fclose(fp_in);
+	fclose(fp_out);
+
+	/* Atomic rename */
+	ret = rename(out_file, dat->file);
+	if (ret != 0) {
+		tlog(TLOG_ERROR, "geosite-dat %s: rename failed: %s", dat->name, strerror(errno));
+		unlink(out_file);
+		unlink(temp_file);
+		return -1;
+	}
+
+	unlink(temp_file);
+	tlog(TLOG_DEBUG, "geosite-dat %s: download complete (%d domains normalized)", dat->name, domain_count);
+	return 0; /* success */
+}
+
 #ifdef __linux__
-/* Background download thread function */
+/* Background download thread function — wraps _geosite_download_one_url() */
 static void *_geosite_download_thread(void *arg)
 {
 	struct geosite_download_arg *dlarg = (struct geosite_download_arg *)arg;
 	int ret = -1;
 	char new_etag[128] = {0};
 
-	tlog(TLOG_DEBUG, "geosite-dat %s: async download started from %s", dlarg->name,
-		 dlarg->is_url ? dlarg->url : dlarg->file);
-
 	if (dlarg->is_url) {
-		/* Download to temp file */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-		char temp_file[DNS_MAX_PATH];
-		snprintf(temp_file, sizeof(temp_file), "%s.XXXXXX", dlarg->file);
-		temp_file[sizeof(temp_file) - 8] = '\0';
-#pragma GCC diagnostic pop
-		int fd = mkstemp(temp_file);
-		if (fd < 0) {
-			tlog(TLOG_ERROR, "geosite-dat %s: create temp file failed: %s", dlarg->name, strerror(errno));
+		struct geosite_dat *dat = _geosite_dat_find_by_name(dlarg->name);
+		if (dat == NULL) {
+			tlog(TLOG_ERROR, "geosite-dat %s: not found in table", dlarg->name);
 			goto out;
 		}
-		close(fd);
 
-		/* Download with ETag support, retry on failure */
-		int retry = 0;
-		for (retry = 0; retry <= geosite_updater.http_retry; retry++) {
-			ret = _download_file(dlarg->url, temp_file, dlarg->etag, new_etag);
-			if (ret >= 0 || retry >= geosite_updater.http_retry) {
-				break;
-			}
-			tlog(TLOG_WARN, "geosite-dat %s: download failed, retry %d/%d",
-				dlarg->name, retry + 1, geosite_updater.http_retry);
-			sleep(geosite_updater.http_retry_interval);
-		}
+		ret = _geosite_download_one_url(dat, new_etag);
+
 		if (ret == 1) {
-			/* 304 Not Modified — server confirmed content unchanged.
-			 * No need to run diff-algo comparison; just update last_update
-			 * and clear downloading flag directly. */
-			unlink(temp_file);
-			{
-				struct geosite_dat *dat = _geosite_dat_find_by_name(dlarg->name);
-				if (dat) {
-					dat->last_update = time(NULL);
-					dat->downloading = 0;
-					if (new_etag[0]) {
-						safe_strncpy(dat->etag, new_etag, sizeof(dat->etag));
-					}
-				}
-			}
-			tlog(TLOG_DEBUG, "geosite-dat %s: content not changed (ETag 304, skipped %s check)",
-				dlarg->name,
-				(geosite_updater.diff_algo == GEOSITE_DIFF_CRC32) ? "crc32" :
-				(geosite_updater.diff_algo == GEOSITE_DIFF_MD5)   ? "md5" : "mtime");
-			ret = 0;
-			goto out_skip_notify;
-		}
-		if (ret != 0) {
-			unlink(temp_file);
-			goto out;
-		}
-
-		/* Verify and normalize: parse downloaded file and rewrite */
-		FILE *fp_in = fopen(temp_file, "r");
-		if (fp_in == NULL) {
-			tlog(TLOG_ERROR, "geosite-dat %s: open temp file failed: %s", dlarg->name, strerror(errno));
-			unlink(temp_file);
-			ret = -1;
-			goto out;
-		}
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-		char out_file[DNS_MAX_PATH];
-		snprintf(out_file, sizeof(out_file), "%s.new", dlarg->file);
-		out_file[sizeof(out_file) - 5] = '\0';
-#pragma GCC diagnostic pop
-		FILE *fp_out = fopen(out_file, "w");
-		if (fp_out == NULL) {
-			tlog(TLOG_ERROR, "geosite-dat %s: create output file failed: %s", dlarg->name, strerror(errno));
-			fclose(fp_in);
-			unlink(temp_file);
-			ret = -1;
-			goto out;
-		}
-
-		char line[MAX_LINE_LEN];
-		char value[DNS_MAX_CNAME_LEN];
-		int line_no = 0;
-		int filed_num = 0;
-		while (fgets(line, MAX_LINE_LEN, fp_in)) {
-			char *p = line;
-			line_no++;
-			if (line_no == 1 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB &&
-				(unsigned char)line[2] == 0xBF) {
-				p += 3;
-			}
-			filed_num = sscanf(p, "%255s", value);
-			if (filed_num <= 0) {
-				continue;
-			}
-			if (value[0] == '#' || value[0] == '\n' || value[0] == '\0') {
-				fprintf(fp_out, "%s", line);
-				continue;
-			}
-			char domain[DNS_MAX_CNAME_LEN];
-			char *d_ptr = value;
-			while (*d_ptr == '.') {
-				if (*(d_ptr + 1) == '\0') break;
-				d_ptr++;
-			}
-			if (*d_ptr == '\0') {
-				fprintf(fp_out, "%s", line);
-				continue;
-			}
-			if (utf8_to_punycode(d_ptr, strlen(d_ptr), domain, sizeof(domain)) <= 0) {
-				fprintf(fp_out, "%s", line);
-				continue;
-			}
-			if (!_is_valid_domain(domain)) {
-				continue;
-			}
-			fprintf(fp_out, "%s\n", domain);
-		}
-
-		fclose(fp_in);
-		fclose(fp_out);
-
-		/* Compare normalized content with existing file using diff-algo */
-		if (dlarg->diff_algo != GEOSITE_DIFF_MTIME && access(dlarg->file, F_OK) == 0) {
-			/* Compute hash of both files and compare */
-			char old_hash[33] = {0};
-			char new_hash[33] = {0};
-			int has_old = (_compute_file_hash(dlarg->file, dlarg->diff_algo, old_hash, sizeof(old_hash)) == 0);
-			int has_new = (_compute_file_hash(out_file, dlarg->diff_algo, new_hash, sizeof(new_hash)) == 0);
-
-			if (has_old && has_new && strcmp(old_hash, new_hash) == 0) {
-				/* Content identical after normalization — no change.
-				 * Skip need_update/reload; directly clean up state. */
-				const char *algo_name = (dlarg->diff_algo == GEOSITE_DIFF_CRC32) ? "crc32" :
-				                        (dlarg->diff_algo == GEOSITE_DIFF_MD5)   ? "md5" : "mtime";
-				tlog(TLOG_DEBUG, "geosite-dat %s: content unchanged (%s match)", dlarg->name, algo_name);
-				unlink(out_file);
-				unlink(temp_file);
-				/* Clean up downloading/last_update directly (no need_update) */
-				{
-					uint32_t key = hash_string(dlarg->name);
-					struct geosite_dat *dat = NULL;
-					hash_for_each_possible(geosite_dat_table.dats, dat, node, key)
-					{
-						if (strcmp(dat->name, dlarg->name) == 0) {
-							dat->last_update = time(NULL);
-							dat->downloading = 0;
-							if (new_etag[0]) {
-								safe_strncpy(dat->etag, new_etag, sizeof(dat->etag));
-							}
-							break;
-						}
-					}
-				}
-				ret = 0;
-				goto out_skip_notify;
-			}
-		}
-
-		ret = rename(out_file, dlarg->file);
-		if (ret != 0) {
-			tlog(TLOG_ERROR, "geosite-dat %s: rename failed: %s", dlarg->name, strerror(errno));
-			unlink(out_file);
-			unlink(temp_file);
-			ret = -1;
-			goto out;
-		}
-
-		unlink(temp_file);
-
-		/* Update ETag in the dat struct */
-		if (new_etag[0]) {
-			struct geosite_dat *dat = _geosite_dat_find_by_name(dlarg->name);
-			if (dat) {
+			/* 304 Not Modified */
+			dat->last_update = time(NULL);
+			dat->downloading = 0;
+			if (new_etag[0]) {
 				safe_strncpy(dat->etag, new_etag, sizeof(dat->etag));
 			}
+			goto out_skip_notify;
+		}
+
+		if (ret != 0) {
+			goto out;
+		}
+
+		/* Update ETag on success */
+		if (new_etag[0]) {
+			safe_strncpy(dat->etag, new_etag, sizeof(dat->etag));
 		}
 	}
 
@@ -1351,6 +1339,63 @@ static int _geosite_dat_update(struct geosite_dat *dat)
 
 	/* URL sources: handled by async download in geosite_check_and_download() */
 	return -1;
+}
+
+/* Synchronously download all URL-based geosite-dat files and check local files.
+ * Blocks until all downloads complete and rules are reloaded.
+ * Used by --check-domain-rule to ensure latest data before checking.
+ *
+ * Reuses:
+ *   - _geosite_download_one_url()  for URL sources (download+normalize)
+ *   - _geosite_dat_update()        for local file change detection (mtime/hash) */
+int geosite_download_url_files_sync(void)
+{
+	struct geosite_dat *dat = NULL;
+	unsigned long i = 0;
+
+	hash_for_each(geosite_dat_table.dats, i, dat, node)
+	{
+		if (dat->is_url) {
+			/* URL source: download + normalize */
+			tlog(TLOG_INFO, "geosite: sync downloading %s from %s...", dat->name, dat->url);
+			char new_etag[128] = {0};
+			int dl_ret = _geosite_download_one_url(dat, new_etag);
+
+			if (dl_ret == 1) {
+				/* 304 Not Modified */
+				dat->last_update = time(NULL);
+				if (new_etag[0]) {
+					safe_strncpy(dat->etag, new_etag, sizeof(dat->etag));
+				}
+				continue;
+			}
+
+			if (dl_ret != 0) {
+				tlog(TLOG_ERROR, "geosite-dat %s: sync download failed after %d retries", dat->name,
+					 geosite_updater.http_retry + 1);
+				continue;
+			}
+
+			/* Download succeeded — update ETag and mark for reload */
+			if (new_etag[0]) {
+				safe_strncpy(dat->etag, new_etag, sizeof(dat->etag));
+			}
+
+			dat->need_update = 1;
+			dat->last_update = time(NULL);
+
+			tlog(TLOG_INFO, "geosite-dat %s: sync download complete, file updated", dat->name);
+		} else {
+			/* Local file: check for changes using configured diff-algo (mtime/crc32/md5) */
+			if (_geosite_dat_update(dat) == 0) {
+				dat->need_update = 1;
+				tlog(TLOG_DEBUG, "geosite-dat %s: local file changed", dat->name);
+			}
+		}
+	}
+
+	/* Reload rules if any files were updated */
+	return geosite_reload_rules();
 }
 
 /* Check all geosite data sources and trigger async downloads if needed.

@@ -115,6 +115,11 @@ int dns_server_get_server_name(char *name, int name_len);
 
 void dns_server_enable_update_neighbor_cache(int enable);
 
+/* Check which rule group a domain matches
+ * Returns: group name string (e.g., "cn", "default"), never NULL
+ */
+const char *dns_server_check_domain_rule(const char *domain);
+
 #ifdef __cplusplus
 }
 #endif

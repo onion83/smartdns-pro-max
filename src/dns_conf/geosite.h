@@ -129,6 +129,11 @@ int geosite_dat_foreach_domain(const char *dat_name, geosite_domain_cb callback,
 /* Check and update geosite data if needed (non-blocking, triggers async download) */
 int geosite_check_and_download(void);
 
+/* Synchronously download all URL-based geosite-dat files.
+ * Blocks until all downloads complete and rules are reloaded.
+ * Used by --check-domain-rule to ensure latest data before checking. */
+int geosite_download_url_files_sync(void);
+
 /* Reload geosite rules into ART tree (called on main thread after download completes) */
 int geosite_reload_rules(void);
 

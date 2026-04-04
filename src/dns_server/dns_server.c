@@ -61,6 +61,8 @@
 #include "smartdns/lib/nftset.h"
 #include "smartdns/util.h"
 
+#include "../dns_conf/domain_rule.h"
+
 #include <errno.h>
 #include <signal.h>
 #include <string.h>
@@ -1005,4 +1007,9 @@ void dns_server_exit(void)
 	dns_cache_destroy();
 
 	is_server_init = 0;
+}
+
+const char *dns_server_check_domain_rule(const char *domain)
+{
+	return dns_conf_check_domain_group(domain);
 }

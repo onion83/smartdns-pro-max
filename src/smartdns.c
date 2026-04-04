@@ -62,6 +62,7 @@ typedef enum {
 static int verbose_screen;
 static int exit_status;
 static int exit_restart;
+static char *check_domain_rule_name = NULL;
 
 static void _help(void)
 {
@@ -84,6 +85,7 @@ static void _help(void)
 #endif
 		"  --cache-print [file]  print cache.\n"
 		"  --is-quic-supported   is quic http3 supported.\n"
+		"  --check-domain-rule [domain]  check which rule group a domain matches.\n"
 		""
 
 		"Online help: https://pymumu.github.io/smartdns\n"
@@ -1101,6 +1103,7 @@ int smartdns_main(int argc, char *argv[])
 
 	static struct option long_options[] = {{"cache-print", required_argument, NULL, 256},
 										   {"is-quic-supported", no_argument, NULL, 257},
+										   {"check-domain-rule", required_argument, NULL, 258},
 										   {"help", no_argument, NULL, 'h'},
 										   {NULL, 0, NULL, 0}};
 
@@ -1171,6 +1174,9 @@ int smartdns_main(int argc, char *argv[])
 			}
 			return 0;
 			break;
+		case 258:
+			check_domain_rule_name = optarg;
+			break;
 		default:
 			fprintf(stderr, "unknown option, please run %s -h for help.\n", argv[0]);
 			return 1;
@@ -1209,6 +1215,39 @@ int smartdns_main(int argc, char *argv[])
 	if (ret != 0) {
 		fprintf(stderr, "load config failed.\n");
 		goto errout;
+	}
+
+	/* Check domain rule - exit after check, no need to start server */
+	if (check_domain_rule_name != NULL) {
+		/* Show loaded geosite data sources */
+		struct geosite_dat *dat = NULL;
+		unsigned long _gi = 0;
+		printf("FILE:\n");
+		hash_for_each(geosite_dat_table.dats, _gi, dat, node)
+		{
+			if (!dat->is_url) {
+				printf("  %s: %s\n", dat->name, dat->file);
+			}
+		}
+		printf("URL:\n");
+		hash_for_each(geosite_dat_table.dats, _gi, dat, node)
+		{
+			if (dat->is_url) {
+				printf("  %s: %s -> %s\n", dat->name, dat->url, dat->file);
+			}
+		}
+
+		/* Suppress download logs for clean CLI output (errors still visible) */
+		tlog_level saved_level = tlog_getlevel();
+		tlog_setlevel(TLOG_ERROR);
+
+		/* Ensure URL-based geosite files are downloaded before checking */
+		geosite_download_url_files_sync();
+
+		tlog_setlevel(saved_level);
+		const char *group = dns_server_check_domain_rule(check_domain_rule_name);
+		printf("RESULT:\n-------------------------\n%s -> %s\n-------------------------\n", check_domain_rule_name, group);
+		return 0;
 	}
 
 	/* started by systemd, do not restart when crash */

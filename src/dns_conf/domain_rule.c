@@ -1233,3 +1233,59 @@ void *dns_conf_get_domain_rule(const char *domain, enum domain_rule type)
 
 	return domain_rule->rules[type];
 }
+
+const char *dns_conf_check_domain_group(const char *domain)
+{
+	struct dns_domain_rule *domain_rule = NULL;
+	struct dns_group_rule *group_rule = NULL;
+	struct dns_nameserver_rule *nameserver_rule = NULL;
+	struct dns_conf_group *conf_group = NULL;
+	char check_domain[DNS_MAX_CONF_CNAME_LEN];
+	char domain_key[DNS_MAX_CONF_CNAME_LEN] = {0};
+	int len = 0;
+	const char *p = NULL;
+
+	/* Use default rule group for check-domain-rule command */
+	conf_group = dns_server_get_default_rule_group();
+	if (conf_group == NULL) {
+		return "default";
+	}
+
+	/* Try exact match and each parent suffix: www.qq.com -> qq.com */
+	safe_strncpy(check_domain, domain, sizeof(check_domain));
+
+	for (p = check_domain; p && *p; ) {
+		if (_config_setup_domain_key(p, domain_key, sizeof(domain_key), &len, NULL, NULL) != 0) {
+			break;
+		}
+
+		domain_rule = art_search(&conf_group->domain_rule.tree, (unsigned char *)domain_key, len);
+		if (domain_rule != NULL) {
+			/* Check GROUP rule (-g option) */
+			if (DOMAIN_RULE_GROUP < domain_rule->capacity) {
+				group_rule = (struct dns_group_rule *)domain_rule->rules[DOMAIN_RULE_GROUP];
+				if (group_rule != NULL && group_rule->group_name != NULL) {
+					return group_rule->group_name;
+				}
+			}
+
+			/* Also check NAMESERVER rule (-n option) */
+			if (DOMAIN_RULE_NAMESERVER < domain_rule->capacity) {
+				nameserver_rule =
+					(struct dns_nameserver_rule *)domain_rule->rules[DOMAIN_RULE_NAMESERVER];
+				if (nameserver_rule != NULL && nameserver_rule->group_name != NULL) {
+					return nameserver_rule->group_name;
+				}
+			}
+		}
+
+		/* Move to next parent domain */
+		p = strchr(p, '.');
+		if (p == NULL || *(++p) == '\0') {
+			break;
+		}
+	}
+
+	return "default";
+}
+

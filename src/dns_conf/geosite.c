@@ -1105,9 +1105,17 @@ static int _geosite_download_one_url(struct geosite_dat *dat, char *out_etag)
 	char temp_file[DNS_MAX_PATH];
 	int domain_count = 0;
 
+	/* Use system temp directory for download staging, not data-dir */
+	const char *tmpdir = getenv("TMPDIR");
+	if (tmpdir == NULL || tmpdir[0] == '\0') {
+		tmpdir = P_tmpdir;
+	}
+	if (tmpdir == NULL || tmpdir[0] == '\0') {
+		tmpdir = "/tmp";
+	}
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
-	snprintf(temp_file, sizeof(temp_file), "%s.XXXXXX", dat->file);
+	snprintf(temp_file, sizeof(temp_file), "%s/smartdns-geosite.XXXXXX", tmpdir);
 	temp_file[sizeof(temp_file) - 8] = '\0';
 #pragma GCC diagnostic pop
 

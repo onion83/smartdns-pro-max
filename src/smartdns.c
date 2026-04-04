@@ -1052,6 +1052,89 @@ static int smartdns_init_workdir(void)
 	return 0;
 }
 
+/* Protocol prefix for dns_server_type_t display */
+#define _DNS_TYPE_PREFIX(t) \
+	(((t) == DNS_SERVER_UDP) ? "udp://" : ((t) == DNS_SERVER_TCP) ? "tcp://" : \
+	 ((t) == DNS_SERVER_TLS) ? "tls://" : ((t) == DNS_SERVER_HTTPS) ? "https://" : \
+	 ((t) == DNS_SERVER_QUIC) ? "quic://" : ((t) == DNS_SERVER_HTTP3) ? "h3://" : "")
+
+/**
+ * CLI: check which group a domain matches, show data sources + DNS servers.
+ * Returns 0 on success (caller should return/exit).
+ */
+static int _smartdns_check_domain_rule(const char *domain)
+{
+	/* Show loaded geosite data sources */
+	struct geosite_dat *dat = NULL;
+	unsigned long _gi = 0;
+	printf("FILE:\n");
+	hash_for_each(geosite_dat_table.dats, _gi, dat, node)
+	{
+		if (!dat->is_url) {
+			printf("  %s: %s\n", dat->name, dat->file);
+		}
+	}
+	printf("URL:\n");
+	hash_for_each(geosite_dat_table.dats, _gi, dat, node)
+	{
+		if (dat->is_url) {
+			printf("  %s: %s -> %s\n", dat->name, dat->url, dat->file);
+		}
+	}
+
+	/* Suppress download logs for clean CLI output (errors still visible) */
+	tlog_level saved_level = tlog_getlevel();
+	tlog_setlevel(TLOG_ERROR);
+
+	/* Ensure URL-based geosite files are downloaded before checking */
+	geosite_download_url_files_sync();
+
+	tlog_setlevel(saved_level);
+
+	const char *group = dns_server_check_domain_rule(domain);
+
+	printf("RESULT:\n-------------------------\n%s -> %s", domain, group);
+
+	/* Show DNS servers in this group */
+	int _found = 0;
+
+	/* Try hash table first (named groups) */
+	uint32_t _gkey = hash_string(group);
+	struct dns_server_groups *_gsg = NULL;
+	hash_for_each_possible(dns_group_table.group, _gsg, node, _gkey)
+	{
+		if (strcmp(_gsg->group_name, group) == 0) {
+			_found = 1;
+			printf(" (");
+			for (int _si = 0; _si < _gsg->server_num && _si < DNS_MAX_SERVERS; _si++) {
+				if (_si > 0) printf(" ");
+				struct dns_servers *s = _gsg->servers[_si];
+				printf("%s%s", _DNS_TYPE_PREFIX(s->type), s->server);
+				if (s->port > 0 && s->port != DEFAULT_DNS_PORT)
+					printf(":%d", s->port);
+			}
+			printf(")");
+			break;
+		}
+	}
+
+	/* Fallback: default group uses dns_conf.servers[] */
+	if (!_found && strcmp(group, "default") == 0) {
+		printf(" (");
+		for (int _si = 0; _si < dns_conf.server_num; _si++) {
+			if (_si > 0) printf(" ");
+			struct dns_servers *s = &dns_conf.servers[_si];
+			printf("%s%s", _DNS_TYPE_PREFIX(s->type), s->server);
+			if (s->port > 0 && s->port != DEFAULT_DNS_PORT)
+				printf(":%d", s->port);
+		}
+		printf(")");
+	}
+
+	printf("\n-------------------------\n");
+	return 0;
+}
+
 #ifdef TEST
 
 static smartdns_post_func _smartdns_post = NULL;
@@ -1219,35 +1302,7 @@ int smartdns_main(int argc, char *argv[])
 
 	/* Check domain rule - exit after check, no need to start server */
 	if (check_domain_rule_name != NULL) {
-		/* Show loaded geosite data sources */
-		struct geosite_dat *dat = NULL;
-		unsigned long _gi = 0;
-		printf("FILE:\n");
-		hash_for_each(geosite_dat_table.dats, _gi, dat, node)
-		{
-			if (!dat->is_url) {
-				printf("  %s: %s\n", dat->name, dat->file);
-			}
-		}
-		printf("URL:\n");
-		hash_for_each(geosite_dat_table.dats, _gi, dat, node)
-		{
-			if (dat->is_url) {
-				printf("  %s: %s -> %s\n", dat->name, dat->url, dat->file);
-			}
-		}
-
-		/* Suppress download logs for clean CLI output (errors still visible) */
-		tlog_level saved_level = tlog_getlevel();
-		tlog_setlevel(TLOG_ERROR);
-
-		/* Ensure URL-based geosite files are downloaded before checking */
-		geosite_download_url_files_sync();
-
-		tlog_setlevel(saved_level);
-		const char *group = dns_server_check_domain_rule(check_domain_rule_name);
-		printf("RESULT:\n-------------------------\n%s -> %s\n-------------------------\n", check_domain_rule_name, group);
-		return 0;
+		return _smartdns_check_domain_rule(check_domain_rule_name);
 	}
 
 	/* started by systemd, do not restart when crash */

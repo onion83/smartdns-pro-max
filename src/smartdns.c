@@ -1121,12 +1121,18 @@ static int _smartdns_check_domain_rule(const char *domain)
 	/* Fallback: default group uses dns_conf.servers[] */
 	if (!_found && strcmp(group, "default") == 0) {
 		printf(" (");
+		int _first = 1;
 		for (int _si = 0; _si < dns_conf.server_num; _si++) {
-			if (_si > 0) printf(" ");
 			struct dns_servers *s = &dns_conf.servers[_si];
+			if (s->server_flag & SERVER_FLAG_EXCLUDE_DEFAULT)
+				continue;
+			if (!_first) printf(" ");
+			_first = 0;
 			printf("%s%s", _DNS_TYPE_PREFIX(s->type), s->server);
 			if (s->port > 0 && s->port != DEFAULT_DNS_PORT)
 				printf(":%d", s->port);
+			if (s->fallback)
+				printf("*");
 		}
 		printf(")");
 	}

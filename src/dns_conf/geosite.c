@@ -1960,35 +1960,19 @@ int _config_geosite_dat(void *data, int argc, char *argv[])
 			mkdir(resolved_data_dir, 0755);
 		}
 
-		/* Download if local file doesn't exist */
 		if (access(dat->file, F_OK) != 0) {
-			tlog(TLOG_DEBUG, "geosite-dat %s: downloading from %s", name, dat->url);
-			char new_etag[128] = {0};
-			int dl_ret = -1;
-			int retry = 0;
-			for (retry = 0; retry <= geosite_updater.http_retry; retry++) {
-				dl_ret = _download_file(dat->url, dat->file, NULL, new_etag);
-				if (dl_ret >= 0 || retry >= geosite_updater.http_retry) {
-					break;
-				}
-				tlog(TLOG_DEBUG, "geosite-dat %s: initial download failed, retry %d/%d",
-					name, retry + 1, geosite_updater.http_retry);
-				sleep(geosite_updater.http_retry_interval);
-			}
-			if (dl_ret == 0) {
-				dat->last_update = time(NULL);
-				if (new_etag[0]) {
-					safe_strncpy(dat->etag, new_etag, sizeof(dat->etag));
-				}
-			} else {
-				tlog(TLOG_DEBUG, "geosite-dat %s: initial download failed, will retry later.", name);
-			}
+			/* No local cache — skip blocking download, let async updater handle it.
+			 * Set last_update=0 so geosite_check_and_download() triggers download immediately. */
+			tlog(TLOG_INFO, "geosite-dat %s: no cached file at %s, will download from %s in background",
+				name, dat->file, dat->url);
+			dat->last_update = 0;
 		} else {
-			/* File already exists, compute initial hash */
+			/* Local cache exists — use it immediately (fast startup) */
 			dat->last_update = time(NULL);
 			if (geosite_updater.diff_algo != GEOSITE_DIFF_MTIME) {
 				_compute_file_hash(dat->file, geosite_updater.diff_algo, dat->file_hash, sizeof(dat->file_hash));
 			}
+			tlog(TLOG_INFO, "geosite-dat %s: cached (%s)", name, dat->file);
 		}
 	}
 

@@ -78,10 +78,12 @@ int _config_plugin(void *data, int argc, char *argv[])
 	};
 	// clang-format on
 	const int plugin_dir_len = sizeof(plugin_dir) / sizeof(plugin_dir[0]);
-#ifdef BUILD_STATIC
+	// clang-format off
+#if defined(BUILD_STATIC) && !defined(BUILD_STATIC_DEPS)
 	tlog(TLOG_ERROR, "plugin not support in static release, please install dynamic release.");
 	goto errout;
 #endif
+	// clang-format on
 	char file[DNS_MAX_PATH];
 	unsigned int key = 0;
 	int i = 0;

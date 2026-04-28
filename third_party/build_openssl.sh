@@ -58,5 +58,31 @@ cd "${OPENSSL_SRC}"
 echo "Building (jobs=${JOBS})..."
 make -j"${JOBS}" > /dev/null 2>&1
 make install_sw > /dev/null 2>&1
+RC=$?
+if [ ${RC} -ne 0 ]; then
+    echo "ERROR: make install_sw failed with code ${RC}" >&2
+    exit ${RC}
+fi
+
+# Verify installation
+for lib in "libssl.a" "libcrypto.a"; do
+    found=0
+    for dir in "${INSTALL_DIR}/lib" "${INSTALL_DIR}/lib64"; do
+        if [ -f "${dir}/${lib}" ]; then
+            found=1
+            break
+        fi
+    done
+    if [ ${found} -eq 0 ]; then
+        echo "ERROR: ${lib} not found after make install_sw" >&2
+        ls -laR "${INSTALL_DIR}/" 2>/dev/null || true
+        exit 1
+    fi
+done
+
+# Ensure lib symlink exists (some platforms install to lib64)
+if [ ! -d "${INSTALL_DIR}/lib" ] && [ -d "${INSTALL_DIR}/lib64" ]; then
+    ln -sf "${INSTALL_DIR}/lib64" "${INSTALL_DIR}/lib"
+fi
 
 echo "Done. Static library: ${INSTALL_DIR}/lib/libssl.a, ${INSTALL_DIR}/lib/libcrypto.a"

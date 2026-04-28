@@ -40,12 +40,11 @@ echo "Configuring curl ${CURL_VERSION} (static, minimal features, install to ${I
 cd "${CURL_SRC}"
 
 # Support linking against a custom static OpenSSL
-OPENSSL_CFLAGS=""
-OPENSSL_LDFLAGS=""
 if [ -n "${LOCAL_OPENSSL_INSTALL:-}" ]; then
     echo "Using static OpenSSL from ${LOCAL_OPENSSL_INSTALL}"
-    OPENSSL_CFLAGS="-I${LOCAL_OPENSSL_INSTALL}/include"
-    OPENSSL_LDFLAGS="-L${LOCAL_OPENSSL_INSTALL}/lib -lssl -lcrypto"
+    export PKG_CONFIG_PATH="${LOCAL_OPENSSL_INSTALL}/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export CFLAGS="${CFLAGS:-} -fPIC -O2 -I${LOCAL_OPENSSL_INSTALL}/include"
+    export LDFLAGS="${LDFLAGS:-} -L${LOCAL_OPENSSL_INSTALL}/lib"
 fi
 
 ./configure \
@@ -79,9 +78,7 @@ fi
     --without-libgsasl \
     --without-nghttp2 \
     --without-libssh2 \
-    --with-openssl \
-    ${OPENSSL_CFLAGS:+CFLAGS="-fPIC -O2 ${OPENSSL_CFLAGS}"} \
-    ${OPENSSL_LDFLAGS:+LIBS="${OPENSSL_LDFLAGS}"} \
+    ${LOCAL_OPENSSL_INSTALL:+--with-openssl="${LOCAL_OPENSSL_INSTALL}"} \
     > /dev/null 2>&1
 
 echo "Building (jobs=${JOBS})..."

@@ -1,0 +1,46 @@
+# Fully static smartdns build for linux/amd64 (musl, no dynamic dependencies)
+# Produces a single binary + UI plugin that runs on any Linux x86_64 system.
+#
+# Prerequisite: Build the base builder image ONCE:
+#   docker buildx build -f Dockerfile.builder-base --platform linux/amd64 \
+#     --load -t smartdns-builder-x86_64-base .
+#
+# Then build (fast, ~2 min for source only):
+#   docker buildx build -f Dockerfile.static-x86_64 --platform linux/amd64 \
+#     --load -t smartdns-static-x86_64 .
+#
+# Extract:
+#   docker create --name tmp smartdns-static-x86_64
+#   docker cp tmp:/smartdns ./smartdns
+#   docker cp tmp:/usr/lib/smartdns/smartdns_ui.so ./smartdns_ui.so
+#   docker rm tmp
+
+FROM smartdns-builder-x86_64-base AS builder
+
+# Source code (only this changes between builds)
+COPY Makefile /build/Makefile
+COPY src/ /build/src/
+COPY plugin/ /build/plugin/
+COPY systemd/ /build/systemd/
+COPY etc/ /build/etc/
+
+# Build (fast: reuses pre-built Rust/OpenSSL/curl from base)
+RUN cd /build && \
+    echo "=== Building smartdns ===" && \
+    make clean && make STATIC=yes WITH_UI=1 OPTIMIZE_SIZE=1 -j$(nproc) 2>&1 | tail -30 && \
+    echo "=== Done ==="
+
+# Verify outputs
+RUN echo "=== Binary info ===" && \
+    ls -lh /build/src/smartdns && file /build/src/smartdns && \
+    echo "=== UI Plugin ===" && \
+    ls -lh /build/plugin/smartdns-ui/target/smartdns_ui.so && \
+    file /build/plugin/smartdns-ui/target/smartdns_ui.so && \
+    echo "=== OK ==="
+
+# --- Minimal runtime image ---
+FROM scratch
+COPY --from=builder /build/src/smartdns /smartdns
+COPY --from=builder /build/plugin/smartdns-ui/target/smartdns_ui.so /usr/lib/smartdns/smartdns_ui.so
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENTRYPOINT ["/smartdns"]

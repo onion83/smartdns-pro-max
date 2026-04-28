@@ -45,7 +45,7 @@ RUN echo "=== Binary info ===" && \
 # Alpine provides all required shared libraries:
 #   musl libc, libssl, libcrypto, libcurl, pthread, zlib, ld-musl
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates openssl curl
+RUN apk add --no-cache ca-certificates openssl curl libgcc
 COPY --from=builder /build/src/smartdns /usr/sbin/smartdns
 COPY --from=builder /build/plugin/smartdns-ui/target/smartdns_ui.so /usr/lib/smartdns/smartdns_ui.so
 ENTRYPOINT ["/usr/sbin/smartdns"]

@@ -543,6 +543,20 @@ void geosite_log_config_summary(void)
 		geosite_updater.default_interval,
 		geosite_updater.diff_algo == GEOSITE_DIFF_MTIME ? "mtime" : geosite_updater.diff_algo == GEOSITE_DIFF_CRC32 ? "crc32" : "md5");
 
+	/* Log per-dat source status (cached/missing) */
+	hash_for_each(geosite_dat_table.dats, i, dat, node)
+	{
+		if (dat->is_url) {
+			if (access(dat->file, F_OK) == 0) {
+				tlog(TLOG_NOTICE, "geosite-dat %s: cached (%s)", dat->name, dat->file);
+			} else {
+				tlog(TLOG_NOTICE, "geosite-dat %s: no cache, pending download from %s", dat->name, dat->url);
+			}
+		} else {
+			tlog(TLOG_NOTICE, "geosite-dat %s: local (%s)", dat->name, dat->file);
+		}
+	}
+
 	/* Warn if update-interval is too small relative to worst-case download time */
 	int worst_case = geosite_updater.http_timeout * (geosite_updater.http_retry + 1) +
 	                 geosite_updater.http_retry_interval * geosite_updater.http_retry;
@@ -1963,8 +1977,6 @@ int _config_geosite_dat(void *data, int argc, char *argv[])
 		if (access(dat->file, F_OK) != 0) {
 			/* No local cache — skip blocking download, let async updater handle it.
 			 * Set last_update=0 so geosite_check_and_download() triggers download immediately. */
-			tlog(TLOG_INFO, "geosite-dat %s: no cached file at %s, will download from %s in background",
-				name, dat->file, dat->url);
 			dat->last_update = 0;
 		} else {
 			/* Local cache exists — use it immediately (fast startup) */
@@ -1972,7 +1984,6 @@ int _config_geosite_dat(void *data, int argc, char *argv[])
 			if (geosite_updater.diff_algo != GEOSITE_DIFF_MTIME) {
 				_compute_file_hash(dat->file, geosite_updater.diff_algo, dat->file_hash, sizeof(dat->file_hash));
 			}
-			tlog(TLOG_INFO, "geosite-dat %s: cached (%s)", name, dat->file);
 		}
 	}
 

@@ -13,3 +13,5 @@ package/*.ipk
 target
 data/
 third_party/curl/
+smartdns-geosite.conf
+.github

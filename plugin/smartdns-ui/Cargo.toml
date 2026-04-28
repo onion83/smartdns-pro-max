@@ -48,10 +48,12 @@ tempfile = "3.27.0"
 [build-dependencies]
 bindgen = "0.69.5"
 
+[profile.release]
+panic = "abort"
+
 [profile.release-optmize-size]
 inherits = "release"
 lto = true
 opt-level = "s"
 strip = true
 codegen-units = 1
-panic = "abort"

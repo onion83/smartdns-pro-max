@@ -52,6 +52,10 @@ ifdef LOCAL_OPENSSL_LIB
     # In static mode, link against static OpenSSL instead of system -lssl/-lcrypto
     SSL_LDFLAGS := $(LOCAL_OPENSSL_LIB) $(LOCAL_OPENSSL_DIR)/lib/libcrypto.a
     $(info Using local static OpenSSL: $(LOCAL_OPENSSL_LIB))
+  else ifdef STATIC_DEPS
+    # Hybrid mode: also use static OpenSSL/curl
+    SSL_LDFLAGS := $(LOCAL_OPENSSL_LIB) $(LOCAL_OPENSSL_DIR)/lib/libcrypto.a
+    $(info Using local static OpenSSL (hybrid): $(LOCAL_OPENSSL_LIB))
   endif
 endif
 
@@ -113,6 +117,17 @@ ifdef STATIC
   override LDFLAGS += $(SSL_LDFLAGS) -Wl,--whole-archive -lpthread -Wl,--no-whole-archive -ldl -lm -lz -static -rdynamic
  else
   override LDFLAGS += -lssl -lcrypto -Wl,--whole-archive -lpthread -Wl,--no-whole-archive -ldl -lm -lz -static -rdynamic
+ endif
+else ifdef STATIC_DEPS
+ # Hybrid: static ssl/curl/zlib, dynamic libc+libgcc_s (for dlopen plugin support)
+ # Keep libgcc_s DYNAMIC so .so plugins can resolve _Unwind_* symbols from it at runtime
+ override CFLAGS += -DBUILD_STATIC_DEPS
+ ifdef SSL_LDFLAGS
+  # SSL_LDFLAGS already points to static .a files; force -lz static too
+  override LDFLAGS += $(SSL_LDFLAGS) -Wl,-Bstatic -lz -Wl,-Bdynamic -lpthread -ldl -lm -rdynamic
+ else
+  # Fallback: use system libs with -Bstatic forcing
+  override LDFLAGS += -Wl,-Bstatic -lssl -lcrypto -lz -Wl,-Bdynamic -lpthread -ldl -lm -rdynamic
  endif
 else
  override LDFLAGS += -lssl -lcrypto -lpthread -ldl -lm -rdynamic

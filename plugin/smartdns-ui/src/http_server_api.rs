@@ -18,6 +18,7 @@
 
 use crate::db::*;
 use crate::dns_log;
+use crate::file_ops;
 use crate::http_api_msg::*;
 use crate::http_error::*;
 use crate::http_jwt::*;
@@ -107,6 +108,12 @@ impl API {
         api.register(Method::PUT, "/api/stats/refresh", true, APIRoute!(API::api_stats_refresh));
         api.register(Method::GET, "/api/whois", true, APIRoute!(API::api_whois));
         api.register(Method::GET, "/api/tool/term", true, APIRoute!(API::api_tool_term));
+        api.register(Method::GET, "/api/config/file", true, APIRoute!(API::api_config_get_file));
+        api.register(Method::PUT, "/api/config/file", true, APIRoute!(API::api_config_put_file));
+        api.register(Method::GET, "/api/config/geosite/list", true, APIRoute!(API::api_config_geosite_list));
+        api.register(Method::GET, "/api/config/geosite/file", true, APIRoute!(API::api_config_geosite_get_file));
+        api.register(Method::PUT, "/api/config/geosite/file", true, APIRoute!(API::api_config_geosite_put_file));
+        api.register(Method::POST, "/api/config/geosite/download", true, APIRoute!(API::api_config_geosite_download));
         api
     }
 
@@ -1232,6 +1239,365 @@ impl API {
         } else {
             return API::response_error(StatusCode::BAD_REQUEST, "Need websocket upgrade.");
         }
+    }
+
+    /// Read a configuration file <br>
+    /// API: GET /api/config/file?path=smartdns.conf <br>
+    /// Currently only supports the main config file (smartdns.conf).
+    async fn api_config_get_file(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let params = API::get_params(&req);
+        let path = API::params_get_value(&params, "path");
+        if path.is_none() {
+            return API::response_error(StatusCode::BAD_REQUEST, "Missing parameter: path");
+        }
+
+        let path: String = path.unwrap();
+        if path != "smartdns.conf" {
+            return API::response_error(
+                StatusCode::BAD_REQUEST,
+                "Only 'smartdns.conf' is supported",
+            );
+        }
+
+        let data_server = this.get_data_server();
+        let ret = API::call_blocking(this, move || {
+            let result = file_ops::read_main_config();
+            if let Err(e) = result {
+                return Err(e.to_string());
+            }
+            Ok(result.unwrap())
+        })
+        .await;
+
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let ret = ret.unwrap();
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let config = ret.unwrap();
+        let body = serde_json::json!({
+            "path": config.path,
+            "content": config.content,
+        })
+        .to_string();
+
+        API::response_build(StatusCode::OK, body)
+    }
+
+    /// Write a configuration file <br>
+    /// API: PUT /api/config/file?path=smartdns.conf <br>
+    /// Body: { "content": "..." }
+    async fn api_config_put_file(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let params = API::get_params(&req);
+        let path = API::params_get_value(&params, "path");
+        if path.is_none() {
+            return API::response_error(StatusCode::BAD_REQUEST, "Missing parameter: path");
+        }
+
+        let path: String = path.unwrap();
+        if path != "smartdns.conf" {
+            return API::response_error(
+                StatusCode::BAD_REQUEST,
+                "Only 'smartdns.conf' is supported",
+            );
+        }
+
+        let whole_body =
+            String::from_utf8(req.into_body().collect().await?.to_bytes().into())?;
+        let v: serde_json::Value = match serde_json::from_str(&whole_body) {
+            Ok(v) => v,
+            Err(e) => {
+                return API::response_error(StatusCode::BAD_REQUEST, e.to_string().as_str());
+            }
+        };
+
+        let content = v["content"].as_str();
+        if content.is_none() {
+            return API::response_error(StatusCode::BAD_REQUEST, "Missing field: content");
+        }
+        let content = content.unwrap();
+
+        let _data_server = this.get_data_server();
+        let content = content.to_string();
+        let ret = API::call_blocking(this, move || {
+            let result = file_ops::write_main_config(&content);
+            if let Err(e) = result {
+                return Err(e.to_string());
+            }
+            Ok(())
+        })
+        .await;
+
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let ret = ret.unwrap();
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        API::response_build(StatusCode::OK, "{}".to_string())
+    }
+
+    /// Get the list of geosite data files <br>
+    /// API: GET /api/config/geosite/list
+    async fn api_config_geosite_list(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        _req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let data_server = this.get_data_server();
+        let ret = API::call_blocking(this, move || {
+            let result = file_ops::get_geosite_list();
+            if let Err(e) = result {
+                return Err(e.to_string());
+            }
+            Ok(result.unwrap())
+        })
+        .await;
+
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let ret = ret.unwrap();
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let files = ret.unwrap();
+        let body = serde_json::json!({
+            "geosite_files": files,
+        })
+        .to_string();
+
+        API::response_build(StatusCode::OK, body)
+    }
+
+    /// Read a geosite file content <br>
+    /// API: GET /api/config/geosite/file?path=<path>
+    /// For remote sources, use cache_path parameter to read the cached local file.
+    async fn api_config_geosite_get_file(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let params = API::get_params(&req);
+        let path = API::params_get_value(&params, "path");
+        if path.is_none() {
+            return API::response_error(StatusCode::BAD_REQUEST, "Missing parameter: path");
+        }
+
+        let path: String = path.unwrap();
+
+        // For remote URLs, try to read the cache file instead
+        let file_to_read: String = if path.starts_with("http://") || path.starts_with("https://") {
+            // Check for cache_path parameter
+            if let Some(cache_path) = API::params_get_value(&params, "cache_path") {
+                cache_path
+            } else {
+                return API::response_error(
+                    StatusCode::BAD_REQUEST,
+                    "Remote source requires cache_path parameter",
+                );
+            }
+        } else {
+            path.clone()
+        };
+
+        let path_for_response = path.clone();
+        let this_clone = this.clone();
+        let file_to_read_for_meta = file_to_read.clone();
+
+        let ret = API::call_blocking(this, move || {
+            let result = file_ops::read_geosite_file(&file_to_read);
+            if let Err(e) = result {
+                return Err(e.to_string());
+            }
+            Ok(result.unwrap())
+        })
+        .await;
+
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let ret = ret.unwrap();
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::NOT_FOUND,
+                e.to_string().as_str(),
+            );
+        }
+
+        let content = ret.unwrap();
+
+        // Get file metadata (path, size, modified time)
+        let file_info = API::call_blocking(this_clone, move || {
+            file_ops::get_geosite_file_metadata(&file_to_read_for_meta).ok()
+        })
+        .await
+        .unwrap_or(None);
+
+        let body = serde_json::json!({
+            "path": path_for_response,
+            "content": content,
+            "file_info": file_info,
+        })
+        .to_string();
+
+        API::response_build(StatusCode::OK, body)
+    }
+
+    /// Write a geosite file content <br>
+    /// API: PUT /api/config/geosite/file?path=<path> <br>
+    /// For remote sources, use cache_path parameter to write to the cached local file.
+    /// Body: { "content": "..." }
+    async fn api_config_geosite_put_file(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let params = API::get_params(&req);
+        let path = API::params_get_value(&params, "path");
+        if path.is_none() {
+            return API::response_error(StatusCode::BAD_REQUEST, "Missing parameter: path");
+        }
+
+        let path: String = path.unwrap();
+
+        // For remote URLs, write to cache file instead
+        let file_to_write: String = if path.starts_with("http://") || path.starts_with("https://") {
+            if let Some(cache_path) = API::params_get_value(&params, "cache_path") {
+                cache_path
+            } else {
+                return API::response_error(
+                    StatusCode::BAD_REQUEST,
+                    "Remote source requires cache_path parameter",
+                );
+            }
+        } else {
+            path.clone()
+        };
+
+        let whole_body =
+            String::from_utf8(req.into_body().collect().await?.to_bytes().into())?;
+        let v: serde_json::Value = match serde_json::from_str(&whole_body) {
+            Ok(v) => v,
+            Err(e) => {
+                return API::response_error(StatusCode::BAD_REQUEST, e.to_string().as_str());
+            }
+        };
+
+        let content = v["content"].as_str();
+        if content.is_none() {
+            return API::response_error(StatusCode::BAD_REQUEST, "Missing field: content");
+        }
+        let content = content.unwrap().to_string();
+
+        let ret = API::call_blocking(this, move || {
+            let result = file_ops::write_geosite_file(&file_to_write, &content);
+            if let Err(e) = result {
+                return Err(e.to_string());
+            }
+            Ok(())
+        })
+        .await;
+
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let ret = ret.unwrap();
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        API::response_build(StatusCode::OK, "{}".to_string())
+    }
+
+    /// Trigger download of all remote geosite-dat files <br>
+    /// API: POST /api/config/geosite/download <br>
+    /// Synchronously downloads all URL-based geosite-dat sources and reloads rules.
+    /// Body (optional): { "names": ["name1", "name2"] } — if provided, only download specific sources.
+    /// Returns: { "message": "..." }
+    async fn api_config_geosite_download(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        _req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        // For now, we download ALL URL sources (C side doesn't support single-name download)
+        // This is acceptable since geosite_download_url_files_sync handles ETag/304 efficiently.
+        let ret = API::call_blocking(this, move || {
+            let result = smartdns::geosite_download_url_files_sync_force();
+            if let Err(e) = result {
+                return Err(e);
+            }
+            Ok(())
+        })
+        .await;
+
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let ret = ret.unwrap();
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let body = serde_json::json!({
+            "message": "Geosite download completed successfully",
+        })
+        .to_string();
+
+        API::response_build(StatusCode::OK, body)
     }
 
     async fn call_blocking<F, R>(

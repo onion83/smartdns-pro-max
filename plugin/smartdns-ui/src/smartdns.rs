@@ -24,6 +24,7 @@
 #![allow(improper_ctypes)]
 pub mod smartdns_c {
     include!(concat!(env!("OUT_DIR"), "/smartdns_bindings.rs"));
+    include!(concat!(env!("OUT_DIR"), "/geosite_bindings.rs"));
 }
 
 use std::error::Error;
@@ -320,6 +321,58 @@ pub fn smartdns_conf_get_conf_fullpath(path: &str) -> String {
             .into_owned();
 
         conf_fullpath
+    }
+}
+
+/// Resolve a geosite dat file path using the same logic as the C config parser.
+/// Handles absolute paths, relative paths (./, ../), and bare filenames
+/// by resolving them against the geosite-updater data-dir.
+/// Trigger synchronous download of all URL-based geosite-dat files.
+/// Blocks until all downloads complete and rules are reloaded.
+/// Returns Ok(()) on success, Err(message) on failure.
+pub fn geosite_download_url_files_sync() -> Result<(), String> {
+    unsafe {
+        let ret = smartdns_c::geosite_download_url_files_sync();
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err("geosite download failed".to_string())
+        }
+    }
+}
+
+/// Force synchronous download of all URL-based geosite-dat files.
+/// Clears all ETags before downloading to bypass 304 Not Modified.
+/// Blocks until all downloads complete and rules are reloaded.
+pub fn geosite_download_url_files_sync_force() -> Result<(), String> {
+    unsafe {
+        let ret = smartdns_c::geosite_download_url_files_sync_force();
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err("geosite force download failed".to_string())
+        }
+    }
+}
+
+pub fn geosite_resolve_dat_path(path: &str) -> String {
+    let path = CString::new(path).expect("Failed to convert to CString");
+    unsafe {
+        let mut buffer = [0u8; 4096];
+        let ret = smartdns_c::geosite_resolve_dat_path(
+            path.as_ptr(),
+            buffer.as_mut_ptr() as *mut c_char,
+            buffer.len().try_into().unwrap(),
+        );
+        if ret.is_null() {
+            // Fallback to conf fullpath
+            return smartdns_conf_get_conf_fullpath(
+                std::ffi::CStr::from_ptr(path.as_ptr()).to_str().unwrap_or(""),
+            );
+        }
+        std::ffi::CStr::from_ptr(ret)
+            .to_string_lossy()
+            .into_owned()
     }
 }
 

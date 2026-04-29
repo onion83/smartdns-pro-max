@@ -111,6 +111,60 @@ const struct geosite_updater_config *geosite_get_updater_config(void)
 	return &geosite_updater;
 }
 
+/* Resolve a geosite dat relative file path to absolute path.
+ * Uses the same logic as _config_geosite_dat():
+ *   - Absolute path (/xxx): returned as-is
+ *   - Relative path (./ or ../): resolved relative to data_dir
+ *   - Bare filename: resolved relative to data_dir
+ * Returns the resolved path in 'resolved_path' buffer (size: 'path_len').
+ * Returns NULL on error, resolved_path on success. */
+const char *geosite_resolve_dat_path(const char *file, char *resolved_path, size_t path_len)
+{
+	char resolved_data_dir[PATH_MAX] = {0};
+
+	if (path_len < 1) {
+		return NULL;
+	}
+
+	/* Determine data_dir (same logic as _config_geosite_dat) */
+	if (geosite_updater.data_dir[0]) {
+		safe_strncpy(resolved_data_dir, geosite_updater.data_dir, sizeof(resolved_data_dir));
+	} else {
+		char cwd[PATH_MAX];
+		if (getcwd(cwd, sizeof(cwd)) != NULL) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+			snprintf(resolved_data_dir, sizeof(resolved_data_dir), "%s/data", cwd);
+#pragma GCC diagnostic pop
+			resolved_data_dir[sizeof(resolved_data_dir) - 2] = '\0';
+		} else {
+			safe_strncpy(resolved_data_dir, dns_conf_get_data_dir(), sizeof(resolved_data_dir));
+		}
+	}
+
+	/* Resolve file path */
+	if (file[0] == '/') {
+		/* Absolute path — use directly */
+		safe_strncpy(resolved_path, file, path_len);
+	} else if (file[0] == '.' && (file[1] == '/' || file[1] == '\0' ||
+	                              (file[1] == '.' && file[2] == '/'))) {
+		/* Relative path (./ or ../) — join with data-dir */
+		if (file[1] == '.' && file[2] == '/') {
+			snprintf(resolved_path, path_len, "%s/%s", resolved_data_dir, file);
+		} else if (file[1] == '/') {
+			snprintf(resolved_path, path_len, "%s/%s", resolved_data_dir, file + 2);
+		} else {
+			/* just "." */
+			safe_strncpy(resolved_path, resolved_data_dir, path_len);
+		}
+	} else {
+		/* Bare filename (no path separator) — data-dir + filename */
+		snprintf(resolved_path, path_len, "%s/%s", resolved_data_dir, file);
+	}
+
+	return resolved_path;
+}
+
 static LIST_HEAD(geosite_domain_rule_list);
 
 #ifdef __linux__
@@ -1418,6 +1472,24 @@ int geosite_download_url_files_sync(void)
 
 	/* Reload rules if any files were updated */
 	return geosite_reload_rules();
+}
+
+/* Same as geosite_download_url_files_sync() but clears all ETags first
+ * to force full re-download (bypasses 304 Not Modified). */
+int geosite_download_url_files_sync_force(void)
+{
+	struct geosite_dat *dat = NULL;
+	unsigned long i = 0;
+
+	/* Clear ETags on all URL sources to bypass conditional download */
+	hash_for_each(geosite_dat_table.dats, i, dat, node)
+	{
+		if (dat->is_url) {
+			dat->etag[0] = '\0';
+		}
+	}
+
+	return geosite_download_url_files_sync();
 }
 
 /* Check all geosite data sources and trigger async downloads if needed.

@@ -86,6 +86,21 @@ fn link_smartdns_lib() {
     bindings
         .write_to_file(out_path.join("smartdns_bindings.rs"))
         .expect("Couldn't write bindings!");
+
+    // Generate additional bindings for geosite functions not included in smartdns.h
+    let geosite_bindings = bindgen::Builder::default()
+        .header(format!("{}/dns_conf/geosite.h", smartdns_src_dir))
+        .clang_arg(format!("-I{}/include", smartdns_src_dir))
+        .allowlist_function("geosite_resolve_dat_path")
+        .allowlist_function("geosite_get_updater_config")
+        .allowlist_function("geosite_download_url_files_sync")
+        .allowlist_function("geosite_download_url_files_sync_force")
+        .allowlist_type("geosite_updater_config")
+        .generate()
+        .expect("Unable to generate geosite bindings");
+    geosite_bindings
+        .write_to_file(out_path.join("geosite_bindings.rs"))
+        .expect("Couldn't write geosite bindings!");
     /*
     to run tests, please run the following command:
     make test-prepare

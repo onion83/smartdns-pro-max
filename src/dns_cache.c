@@ -813,7 +813,9 @@ static int _dns_cache_file_read(const char *file, dns_cache_read_callback callba
 
 	filesize = lseek(fd, 0, SEEK_END);
 	lseek(fd, 0, SEEK_SET);
+#ifdef __linux__
 	posix_fadvise(fd, 0, filesize, POSIX_FADV_WILLNEED | POSIX_FADV_SEQUENTIAL);
+#endif
 
 	struct dns_cache_file cache_file;
 	ret = read(fd, &cache_file, sizeof(cache_file));

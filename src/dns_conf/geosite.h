@@ -117,6 +117,14 @@ int _config_geosite_updater(void *data, int argc, char *argv[]);
 /* Get the global geosite updater config */
 const struct geosite_updater_config *geosite_get_updater_config(void);
 
+/* Resolve a geosite dat relative file path to absolute path.
+ * Uses the same logic as internal config parser:
+ *   - Absolute path (/xxx): returned as-is
+ *   - Relative path (./ or ../): resolved relative to data_dir
+ *   - Bare filename: resolved relative to data_dir
+ * Returns NULL on error, 'resolved_path' on success. */
+const char *geosite_resolve_dat_path(const char *file, char *resolved_path, size_t path_len);
+
 /* Domain iteration callback for geosite */
 typedef int (*geosite_domain_cb)(const char *domain, void *priv);
 
@@ -133,6 +141,10 @@ int geosite_check_and_download(void);
  * Blocks until all downloads complete and rules are reloaded.
  * Used by --check-domain-rule to ensure latest data before checking. */
 int geosite_download_url_files_sync(void);
+
+/* Same as geosite_download_url_files_sync() but clears all ETags first
+ * to force full re-download (bypasses 304 Not Modified). */
+int geosite_download_url_files_sync_force(void);
 
 /* Reload geosite rules into ART tree (called on main thread after download completes) */
 int geosite_reload_rules(void);

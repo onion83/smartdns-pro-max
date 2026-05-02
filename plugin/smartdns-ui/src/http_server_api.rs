@@ -1263,7 +1263,6 @@ impl API {
             );
         }
 
-        let data_server = this.get_data_server();
         let ret = API::call_blocking(this, move || {
             let result = file_ops::read_main_config();
             if let Err(e) = result {
@@ -1371,7 +1370,6 @@ impl API {
         _param: APIRouteParam,
         _req: Request<body::Incoming>,
     ) -> Result<Response<Full<Bytes>>, HttpError> {
-        let data_server = this.get_data_server();
         let ret = API::call_blocking(this, move || {
             let result = file_ops::get_geosite_list();
             if let Err(e) = result {

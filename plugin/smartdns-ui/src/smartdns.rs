@@ -370,6 +370,27 @@ pub fn geosite_download_single_url_file_sync(name: &str, force: bool) -> Result<
     }
 }
 
+/// Get a JSON array of all geosite-dat entries from the C hash table.
+/// Returns the JSON string. The C-allocated memory is freed internally.
+/// Format: [{"name":"xxx","path":"/abs/path","url":"https://...","is_url":1}, ...]
+pub fn geosite_dat_list_to_json() -> Result<String, String> {
+    unsafe {
+        let ptr = smartdns_c::geosite_dat_list_to_json();
+        if ptr.is_null() {
+            return Err("geosite_dat_list_to_json returned NULL".to_string());
+        }
+        let s = std::ffi::CStr::from_ptr(ptr)
+            .to_string_lossy()
+            .into_owned();
+        // Free the C-allocated string (malloc'd in geosite.c, use libc free)
+        extern "C" {
+            fn free(ptr: *mut u8);
+        }
+        free(ptr as *mut u8);
+        Ok(s)
+    }
+}
+
 pub fn geosite_resolve_dat_path(path: &str) -> String {
     let path = CString::new(path).expect("Failed to convert to CString");
     unsafe {

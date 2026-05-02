@@ -178,6 +178,11 @@ void geosite_dat_put(struct geosite_dat *dat);
 /* Save domain-rules argv for reload when geosite data changes */
 void geosite_save_domain_rule(const char *set_name, int argc, char *argv[]);
 
+/* Build a JSON array of all geosite-dat entries.
+ * Returns a malloc'd JSON string that the caller must free, or NULL on error.
+ * Format: [{"name":"xxx","path":"/abs/path","url":"https://...","is_url":1}, ...] */
+char *geosite_dat_list_to_json(void);
+
 #ifdef __cplusplus
 }
 #endif /*__cplusplus */

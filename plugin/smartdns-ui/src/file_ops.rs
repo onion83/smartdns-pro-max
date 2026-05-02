@@ -206,18 +206,64 @@ pub fn parse_geosite_list(config_content: &str) -> Vec<GeositeFileInfo> {
     files
 }
 
-/// Get the list of geosite data files as parsed from the running config.
-/// Falls back to parsing the main config file content.
+/// JSON entry returned by C geosite_dat_list_to_json()
+#[derive(Debug, serde::Deserialize)]
+struct GeositeDatJsonEntry {
+    name: String,
+    path: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    is_url: i32,
+}
+
+/// Get the list of geosite data files from the C geosite_dat_table.
+/// This reads the already-parsed hash table, so it correctly handles
+/// geosite-dat entries from conf-file includes.
 pub fn get_geosite_list() -> Result<Vec<GeositeFileInfo>, Box<dyn Error>> {
-    let conf = read_main_config()?;
-    dns_log!(LogLevel::DEBUG, "[geosite] get_geosite_list: config_path='{}', config_size={} bytes",
-        conf.path, conf.content.len());
-    let files = parse_geosite_list(&conf.content);
-    dns_log!(LogLevel::DEBUG, "[geosite] get_geosite_list: parsed {} geosite-dat entries", files.len());
+    let json = crate::smartdns::geosite_dat_list_to_json().map_err(|e| {
+        let msg = format!("geosite_dat_list_to_json failed: {}", e);
+        dns_log!(LogLevel::ERROR, "[geosite] {}", msg);
+        msg
+    })?;
+
+    let entries: Vec<GeositeDatJsonEntry> = serde_json::from_str(&json).map_err(|e| {
+        let msg = format!("Failed to parse geosite JSON: {} (json: {})", e, json);
+        dns_log!(LogLevel::ERROR, "[geosite] {}", msg);
+        msg
+    })?;
+
+    dns_log!(LogLevel::DEBUG, "[geosite] get_geosite_list: {} entries from C hash table", entries.len());
+
+    let files: Vec<GeositeFileInfo> = entries
+        .into_iter()
+        .map(|e| {
+            let is_remote = e.is_url != 0;
+            if is_remote {
+                GeositeFileInfo {
+                    name: e.name,
+                    path: e.url.clone().unwrap_or_default(),
+                    source: "remote".to_string(),
+                    url: e.url,
+                    cache_path: Some(e.path),
+                }
+            } else {
+                GeositeFileInfo {
+                    name: e.name,
+                    path: e.path,
+                    source: "local".to_string(),
+                    url: None,
+                    cache_path: None,
+                }
+            }
+        })
+        .collect();
+
     for f in &files {
         dns_log!(LogLevel::DEBUG, "[geosite]   - name='{}', source='{}', path='{}', cache_path={:?}",
             f.name, f.source, f.path, f.cache_path);
     }
+
     Ok(files)
 }
 

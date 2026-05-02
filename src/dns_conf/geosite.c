@@ -2329,3 +2329,72 @@ int _config_geosite_set(void *data, int argc, char *argv[])
 
 	return 0;
 }
+
+/* Build a JSON array of all geosite-dat entries for the UI plugin.
+ * Returns a malloc'd JSON string that the caller must free, or NULL on error.
+ * Format: [{"name":"xxx","path":"/abs/path","url":"https://...","is_url":1}, ...]
+ * For local files: url is omitted.
+ * For URL sources: path is the local cache file path. */
+char *geosite_dat_list_to_json(void)
+{
+	/* First pass: count entries and calculate buffer size */
+	int count = 0;
+	size_t buf_size = 4; /* "[]" + null */
+	struct geosite_dat *dat = NULL;
+	unsigned long i;
+
+	hash_for_each(geosite_dat_table.dats, i, dat, node)
+	{
+		count++;
+		buf_size += 128; /* overhead for JSON structure per entry */
+		buf_size += strlen(dat->name);
+		buf_size += strlen(dat->file);
+		if (dat->is_url) {
+			buf_size += strlen(dat->url);
+		}
+	}
+
+	if (count == 0) {
+		char *empty = malloc(3);
+		if (empty) {
+			snprintf(empty, 3, "[]");
+		}
+		return empty;
+	}
+
+	char *buf = malloc(buf_size);
+	if (buf == NULL) {
+		return NULL;
+	}
+
+	int offset = 0;
+	offset += snprintf(buf + offset, buf_size - offset, "[");
+
+	int first = 1;
+	hash_for_each(geosite_dat_table.dats, i, dat, node)
+	{
+		if (!first) {
+			offset += snprintf(buf + offset, buf_size - offset, ",");
+		}
+		first = 0;
+
+		/* JSON-escape the name and paths */
+		offset += snprintf(buf + offset, buf_size - offset,
+			"{\"name\":\"%s\",\"path\":\"%s\"",
+			dat->name, dat->file);
+
+		if (dat->is_url) {
+			offset += snprintf(buf + offset, buf_size - offset,
+				",\"url\":\"%s\",\"is_url\":1", dat->url);
+		} else {
+			offset += snprintf(buf + offset, buf_size - offset,
+				",\"is_url\":0");
+		}
+
+		offset += snprintf(buf + offset, buf_size - offset, "}");
+	}
+
+	offset += snprintf(buf + offset, buf_size - offset, "]");
+
+	return buf;
+}

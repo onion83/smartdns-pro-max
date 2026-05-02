@@ -72,6 +72,7 @@ static void _help(void)
 		"Start smartdns server.\n"
 		"  -f            run foreground.\n"
 		"  -c [conf]     config file.\n"
+		"  -t            test configuration and exit.\n"
 		"  -p [pid]      pid file path, '-' means don't create pid file.\n"
 		"  -R            restart smartdns when crash.\n"
 		"  -S            ignore segment fault signal.\n"
@@ -903,6 +904,8 @@ static void _smartdns_run_monitor_sig(int sig)
 	_exit(0);
 }
 
+static int _smartdns_monitor_child_status = 0;
+
 static smartdns_run_monitor_ret _smartdns_run_monitor(int restart_when_crash, int is_run_as_daemon)
 {
 	pid_t pid;
@@ -913,10 +916,12 @@ static smartdns_run_monitor_ret _smartdns_run_monitor(int restart_when_crash, in
 	}
 
 	if (is_run_as_daemon) {
-		switch (daemon_run(NULL)) {
+		int child_status = -1;
+		switch (daemon_run(&child_status)) {
 		case DAEMON_RET_CHILD_OK:
 			break;
 		case DAEMON_RET_PARENT_OK:
+			_smartdns_monitor_child_status = child_status;
 			return SMARTDNS_RUN_MONITOR_EXIT;
 		default:
 			return SMARTDNS_RUN_MONITOR_ERROR;
@@ -1186,6 +1191,7 @@ int smartdns_main(int argc, char *argv[])
 	char pid_file[MAX_LINE_LEN];
 	int is_pid_file_set = 0;
 	int signal_ignore = 0;
+	int config_check_only = 0;
 	int restart_when_crash = getpid() == 1 ? 1 : 0;
 	sigset_t empty_sigblock;
 	struct stat sb;
@@ -1213,10 +1219,13 @@ int smartdns_main(int argc, char *argv[])
 	sigprocmask(SIG_SETMASK, &empty_sigblock, NULL);
 	smartdns_close_allfds();
 
-	while ((opt = getopt_long(argc, argv, "fhc:p:SvxN:R", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "fhtc:p:SvxN:R", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'f':
 			is_run_as_daemon = 0;
+			break;
+		case 't':
+			config_check_only = 1;
 			break;
 		case 'c':
 			if (full_path(config_file, sizeof(config_file), optarg) != 0) {
@@ -1290,7 +1299,7 @@ int smartdns_main(int argc, char *argv[])
 	smartdns_run_monitor_ret init_ret = _smartdns_run_monitor(restart_when_crash, is_run_as_daemon);
 	if (init_ret != SMARTDNS_RUN_MONITOR_OK) {
 		if (init_ret == SMARTDNS_RUN_MONITOR_EXIT) {
-			return 0;
+			return _smartdns_monitor_child_status;
 		}
 		return 1;
 	}
@@ -1304,6 +1313,13 @@ int smartdns_main(int argc, char *argv[])
 	if (ret != 0) {
 		fprintf(stderr, "load config failed.\n");
 		goto errout;
+	}
+
+	/* Config check mode - test config and exit */
+	if (config_check_only) {
+		fprintf(stdout, "configuration test is successful.\n");
+		dns_server_load_exit();
+		return 0;
 	}
 
 	/* Check domain rule - exit after check, no need to start server */

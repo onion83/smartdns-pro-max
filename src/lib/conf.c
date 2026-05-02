@@ -17,6 +17,7 @@
  */
 
 #include "smartdns/lib/conf.h"
+#include "smartdns/tlog.h"
 #include <errno.h>
 #include <getopt.h>
 #include <libgen.h>
@@ -261,6 +262,8 @@ int conf_enum(const char *item, void *data, int argc, char *argv[])
 	struct config_enum *item_enum = data;
 	char *enum_name = argv[1];
 	int i = 0;
+	char valid_values[1024] = {0};
+	int offset = 0;
 
 	if (argc <= 0) {
 		return -1;
@@ -276,10 +279,11 @@ int conf_enum(const char *item, void *data, int argc, char *argv[])
 		}
 	}
 
-	printf("Not found config value '%s', valid value is:\n", enum_name);
 	for (i = 0; item_enum->list[i].name != NULL; i++) {
-		printf(" %s\n", item_enum->list[i].name);
+		offset += snprintf(valid_values + offset, sizeof(valid_values) - offset, "%s\"%s\"", (i > 0) ? ", " : "",
+		                   item_enum->list[i].name);
 	}
+	tlog(TLOG_WARN, "invalid config value '%s' for '%s', valid values: %s", enum_name, item, valid_values);
 
 	return -1;
 }
@@ -548,13 +552,13 @@ static int load_conf_file(const char *file, const struct config_item *items, con
 			continue;
 		}
 
-		/* remove suffix space of value */
-		value_len = value_end - value_begin;
-		if (value_len < 0) {
-			continue;
-		}
+	/* remove suffix space of value */
+	value_len = value_end - value_begin;
+	if (value_len < 0) {
+		value_len = 0;
+	}
 
-		for (i = value_len - 1; i >= 0; i--) {
+	for (i = value_len - 1; i >= 0; i--) {
 			if (value[i] == ' ' || value[i] == '\t') {
 				value[i] = '\0';
 				value_len--;

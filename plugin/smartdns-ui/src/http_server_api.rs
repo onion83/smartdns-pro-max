@@ -110,6 +110,8 @@ impl API {
         api.register(Method::GET, "/api/tool/term", true, APIRoute!(API::api_tool_term));
         api.register(Method::GET, "/api/config/file", true, APIRoute!(API::api_config_get_file));
         api.register(Method::PUT, "/api/config/file", true, APIRoute!(API::api_config_put_file));
+        api.register(Method::POST, "/api/config/validate", true, APIRoute!(API::api_config_validate));
+        api.register(Method::GET, "/api/config/conf-files", true, APIRoute!(API::api_config_conf_files));
         api.register(Method::GET, "/api/config/geosite/list", true, APIRoute!(API::api_config_geosite_list));
         api.register(Method::GET, "/api/config/geosite/file", true, APIRoute!(API::api_config_geosite_get_file));
         api.register(Method::PUT, "/api/config/geosite/file", true, APIRoute!(API::api_config_geosite_put_file));
@@ -1242,8 +1244,8 @@ impl API {
     }
 
     /// Read a configuration file <br>
-    /// API: GET /api/config/file?path=smartdns.conf <br>
-    /// Currently only supports the main config file (smartdns.conf).
+    /// API: GET /api/config/file?path=<filename> <br>
+    /// The path must be a filename within the config directory (validated server-side).
     async fn api_config_get_file(
         this: Arc<HttpServer>,
         _param: APIRouteParam,
@@ -1256,15 +1258,9 @@ impl API {
         }
 
         let path: String = path.unwrap();
-        if path != "smartdns.conf" {
-            return API::response_error(
-                StatusCode::BAD_REQUEST,
-                "Only 'smartdns.conf' is supported",
-            );
-        }
 
         let ret = API::call_blocking(this, move || {
-            let result = file_ops::read_main_config();
+            let result = file_ops::read_config_file(&path);
             if let Err(e) = result {
                 return Err(e.to_string());
             }
@@ -1298,7 +1294,7 @@ impl API {
     }
 
     /// Write a configuration file <br>
-    /// API: PUT /api/config/file?path=smartdns.conf <br>
+    /// API: PUT /api/config/file?path=<filename> <br>
     /// Body: { "content": "..." }
     async fn api_config_put_file(
         this: Arc<HttpServer>,
@@ -1312,12 +1308,6 @@ impl API {
         }
 
         let path: String = path.unwrap();
-        if path != "smartdns.conf" {
-            return API::response_error(
-                StatusCode::BAD_REQUEST,
-                "Only 'smartdns.conf' is supported",
-            );
-        }
 
         let whole_body =
             String::from_utf8(req.into_body().collect().await?.to_bytes().into())?;
@@ -1337,7 +1327,7 @@ impl API {
         let _data_server = this.get_data_server();
         let content = content.to_string();
         let ret = API::call_blocking(this, move || {
-            let result = file_ops::write_main_config(&content);
+            let result = file_ops::write_config_file(&path, &content);
             if let Err(e) = result {
                 return Err(e.to_string());
             }
@@ -1361,6 +1351,99 @@ impl API {
         }
 
         API::response_build(StatusCode::OK, "{}".to_string())
+    }
+
+    /// Validate configuration files <br>
+    /// API: POST /api/config/validate <br>
+    /// Runs `smartdns -t -c <main_config>` as a subprocess.
+    /// Always validates the main config, which recursively includes all sub-configs via conf-file.
+    async fn api_config_validate(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        _req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let conf_file = match file_ops::read_main_config() {
+            Ok(c) => c.path,
+            Err(e) => {
+                return API::response_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().as_str(),
+                );
+            }
+        };
+
+        let ret = API::call_blocking(this, move || {
+            let result = file_ops::validate_config_file(&conf_file);
+            if let Err(e) = result {
+                return Err(e.to_string());
+            }
+            Ok(result.unwrap())
+        })
+        .await;
+
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let ret = ret.unwrap();
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let result = ret.unwrap();
+        let body = serde_json::json!({
+            "valid": result.valid,
+            "message": result.message,
+        })
+        .to_string();
+
+        API::response_build(StatusCode::OK, body)
+    }
+
+    /// Get the list of config files (main + sub-configs via conf-file) <br>
+    /// API: GET /api/config/conf-files
+    async fn api_config_conf_files(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        _req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let ret = API::call_blocking(this, move || {
+            let result = file_ops::parse_conf_files();
+            if let Err(e) = result {
+                return Err(e.to_string());
+            }
+            Ok(result.unwrap())
+        })
+        .await;
+
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let ret = ret.unwrap();
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let files = ret.unwrap();
+        let body = serde_json::json!({
+            "conf_files": files,
+        })
+        .to_string();
+
+        API::response_build(StatusCode::OK, body)
     }
 
     /// Get the list of geosite data files <br>

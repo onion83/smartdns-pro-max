@@ -20,9 +20,10 @@ use crate::dns_log;
 use crate::smartdns::geosite_resolve_dat_path;
 use crate::smartdns::LogLevel;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Information about a geosite data file parsed from smartdns.conf
 #[derive(Debug, Clone, Serialize)]
@@ -311,6 +312,121 @@ pub fn get_geosite_file_metadata(path: &str) -> Result<GeositeFileMetadata, Box<
     })
 }
 
+/// Information about a config file (main or sub-config via conf-file).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfFileInfo {
+    pub name: String,
+    pub path: String,
+    #[serde(rename = "type")]
+    pub file_type: String, // "main" or "sub"
+}
+
+/// Parse conf-file directives from the main config file content.
+/// Returns a list of sub-config file paths (after glob expansion and dedup).
+fn parse_conf_file_directives(content: &str, conf_dir: &Path) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() || parts[0] != "conf-file" {
+            continue;
+        }
+
+        // Skip options like -group, -p, -q, -r, -e, -s
+        let mut idx = 1;
+        while idx < parts.len() && parts[idx].starts_with('-') {
+            idx += 1;
+        }
+
+        if idx >= parts.len() {
+            continue;
+        }
+
+        let pattern = parts[idx];
+
+        // Resolve relative path against conf_dir
+        let full_pattern = if Path::new(pattern).is_absolute() {
+            pattern.to_string()
+        } else {
+            conf_dir.join(pattern).to_string_lossy().into_owned()
+        };
+
+        // Glob expansion
+        if let Ok(entries) = glob::glob(&full_pattern) {
+            for entry in entries.flatten() {
+                if entry.is_file() {
+                    let entry_str = entry.to_string_lossy().into_owned();
+                    if seen.insert(entry_str.clone()) {
+                        files.push(entry_str);
+                    }
+                }
+            }
+        } else {
+            // Not a glob pattern, try as literal path
+            let p = Path::new(&full_pattern);
+            if p.is_file() && seen.insert(full_pattern.clone()) {
+                files.push(full_pattern);
+            }
+        }
+    }
+
+    files
+}
+
+/// Get the list of config files (main + sub-configs via conf-file).
+/// Returns main config first, followed by sub-configs.
+pub fn parse_conf_files() -> Result<Vec<ConfFileInfo>, Box<dyn Error>> {
+    let main_path = get_conf_file_path()?;
+    let main_name = Path::new(&main_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "smartdns.conf".to_string());
+
+    let content = fs::read_to_string(&main_path).map_err(|e| {
+        format!("Failed to read config file '{}': {}", main_path, e)
+    })?;
+
+    let conf_dir = Path::new(&main_path)
+        .parent()
+        .ok_or_else(|| "Cannot determine config directory".to_string())?;
+
+    let sub_paths = parse_conf_file_directives(&content, conf_dir);
+
+    let mut files = Vec::new();
+    files.push(ConfFileInfo {
+        name: main_name,
+        path: main_path,
+        file_type: "main".to_string(),
+    });
+
+    for path in sub_paths {
+        let name = Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        files.push(ConfFileInfo {
+            name,
+            path,
+            file_type: "sub".to_string(),
+        });
+    }
+
+    dns_log!(
+        LogLevel::DEBUG,
+        "[config] parse_conf_files: {} files (1 main, {} sub)",
+        files.len(),
+        files.len() - 1
+    );
+
+    Ok(files)
+}
+
 /// Read the content of a geosite file by its resolved absolute path.
 pub fn read_geosite_file(path: &str) -> Result<String, Box<dyn Error>> {
     let resolved_path = if path.starts_with('/') {
@@ -363,6 +479,161 @@ pub fn write_geosite_file(path: &str, content: &str) -> Result<(), Box<dyn Error
         resolved_path
     );
     Ok(())
+}
+
+/// Validate that a path is safe to access (no path traversal, within conf directory).
+/// Returns Ok(canonicalized absolute path) or Err with message.
+fn validate_config_path(path: &str, conf_dir: &Path) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let p = Path::new(path);
+
+    // Reject paths containing ..
+    if path.contains("..") {
+        return Err(format!("Path traversal not allowed: {}", path).into());
+    }
+
+    // Canonicalize the path (resolves symlinks and .)
+    let canonical = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        conf_dir.join(p)
+    };
+
+    let canonical = canonical
+        .canonicalize()
+        .map_err(|e| format!("Cannot access path '{}': {}", path, e))?;
+
+    // Ensure it's a regular file (not a directory, symlink to dir, etc.)
+    if !canonical.is_file() {
+        return Err(format!("Path '{}' is not a regular file", path).into());
+    }
+
+    Ok(canonical)
+}
+
+/// Get the directory containing the main config file.
+fn get_conf_dir() -> Result<PathBuf, Box<dyn Error>> {
+    let path = get_conf_file_path()?;
+    let parent = Path::new(&path)
+        .parent()
+        .ok_or_else(|| "Cannot determine config directory".to_string())?;
+    Ok(parent.to_path_buf())
+}
+
+/// Read content of any config file within the config directory.
+pub fn read_config_file(path: &str) -> Result<ConfigFileContent, Box<dyn Error>> {
+    let conf_dir = get_conf_dir()?;
+    let resolved = validate_config_path(path, &conf_dir)?;
+
+    let content = fs::read_to_string(&resolved).map_err(|e| {
+        format!(
+            "Failed to read config file '{}': {}",
+            resolved.display(),
+            e
+        )
+    })?;
+
+    let path_str = resolved.to_string_lossy().into_owned();
+    dns_log!(LogLevel::DEBUG, "[config] read_config_file: path='{}'", path_str);
+
+    Ok(ConfigFileContent {
+        path: path_str,
+        content,
+    })
+}
+
+/// Write content to any config file within the config directory.
+pub fn write_config_file(path: &str, content: &str) -> Result<(), Box<dyn Error>> {
+    let conf_dir = get_conf_dir()?;
+    let resolved = validate_config_path(path, &conf_dir)?;
+
+    fs::write(&resolved, content).map_err(|e| {
+        format!(
+            "Failed to write config file '{}': {}",
+            resolved.display(),
+            e
+        )
+    })?;
+
+    dns_log!(
+        LogLevel::INFO,
+        "Config file '{}' updated successfully",
+        resolved.display()
+    );
+    Ok(())
+}
+
+use std::process::Command;
+
+/// Result of a config file validation check
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigValidateResult {
+    pub valid: bool,
+    pub message: String,
+}
+
+/// Validate a config file by running `smartdns -t -c <path>` as a subprocess.
+/// Returns Ok(result) with validation outcome, or Err if the subprocess itself failed to launch.
+pub fn validate_config_file(path: &str) -> Result<ConfigValidateResult, Box<dyn Error>> {
+    let output = Command::new("/usr/sbin/smartdns")
+        .args(["-t", "-c", path])
+        .output()
+        .map_err(|e| {
+            let msg = format!("Failed to run smartdns -t: {}", e);
+            dns_log!(LogLevel::ERROR, "[config] {}", msg);
+            msg
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Patterns in tlog output that indicate config problems but don't cause non-zero exit.
+    const WARN_PATTERNS: &[&str] = &["unsupported config", "process config failed"];
+
+    if output.status.success() {
+        // Even with exit code 0, tlog may have emitted warnings (e.g. "unsupported config at ...").
+        // Scan the combined output for known warning patterns.
+        let combined = format!("{}\n{}", stdout, stderr);
+        let warnings: Vec<&str> = WARN_PATTERNS.iter().filter(|p| combined.contains(**p)).copied().collect();
+
+        if !warnings.is_empty() {
+            let message = stdout.trim().to_string();
+            dns_log!(
+                LogLevel::WARN,
+                "[config] config validation passed with warnings for '{}': {}",
+                path,
+                message
+            );
+            Ok(ConfigValidateResult {
+                valid: false,
+                message,
+            })
+        } else {
+            dns_log!(LogLevel::INFO, "[config] config validation passed for '{}'", path);
+            Ok(ConfigValidateResult {
+                valid: true,
+                message: stdout.trim().to_string(),
+            })
+        }
+    } else {
+        // stderr contains the final "load config failed" summary,
+        // stdout contains detailed per-line errors from tlog (e.g. "process config failed at ...").
+        // Merge both for a complete error report.
+        let mut parts = Vec::new();
+        let stdout_trimmed = stdout.trim();
+        let stderr_trimmed = stderr.trim();
+        if !stdout_trimmed.is_empty() {
+            parts.push(stdout_trimmed.to_string());
+        }
+        if !stderr_trimmed.is_empty() && stderr_trimmed != stdout_trimmed {
+            parts.push(stderr_trimmed.to_string());
+        }
+        let message = parts.join("\n");
+        dns_log!(LogLevel::WARN, "[config] config validation failed for '{}': {}", path, message);
+        Ok(ConfigValidateResult {
+            valid: false,
+            message,
+        })
+    }
 }
 
 #[cfg(test)]

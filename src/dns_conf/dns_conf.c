@@ -281,7 +281,7 @@ int _conf_printf(const char *key, const char *value, const char *file, int linen
 	case CONF_RET_ERR:
 	case CONF_RET_WARN:
 	case CONF_RET_BADCONF:
-		tlog(TLOG_WARN, "process config failed at '%s:%d'.", file, lineno);
+		tlog(TLOG_WARN, "process config '%s' failed at '%s:%d'.", key, file, lineno);
 		return -1;
 		break;
 	case CONF_RET_NOENT:
@@ -289,8 +289,8 @@ int _conf_printf(const char *key, const char *value, const char *file, int linen
 			return 0;
 		}
 
-		tlog(TLOG_WARN, "unsupported config at '%s:%d'.", file, lineno);
-		return 0;
+		tlog(TLOG_WARN, "unsupported config '%s' at '%s:%d'.", key, file, lineno);
+		return -1;
 		break;
 	default:
 		break;

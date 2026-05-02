@@ -49,11 +49,14 @@ fn get_conf_file_path() -> Result<String, Box<dyn Error>> {
     let conf_file = unsafe {
         let ptr = crate::smartdns::smartdns_c::conf_get_conf_file();
         if ptr.is_null() {
+            dns_log!(LogLevel::ERROR, "[geosite] conf_get_conf_file() returned NULL");
             return Err("Config file path is not available".into());
         }
-        std::ffi::CStr::from_ptr(ptr)
+        let s = std::ffi::CStr::from_ptr(ptr)
             .to_string_lossy()
-            .into_owned()
+            .into_owned();
+        dns_log!(LogLevel::DEBUG, "[geosite] conf_get_conf_file() = '{}'", s);
+        s
     };
 
     Ok(conf_file)
@@ -62,11 +65,14 @@ fn get_conf_file_path() -> Result<String, Box<dyn Error>> {
 /// Read the content of the main smartdns.conf file
 pub fn read_main_config() -> Result<ConfigFileContent, Box<dyn Error>> {
     let path = get_conf_file_path()?;
+    dns_log!(LogLevel::DEBUG, "[geosite] read_main_config: path='{}', cwd='{}'",
+        path,
+        std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "unknown".into())
+    );
     let content = fs::read_to_string(&path).map_err(|e| {
-        format!(
-            "Failed to read config file '{}': {}",
-            path, e
-        )
+        let msg = format!("Failed to read config file '{}': {}", path, e);
+        dns_log!(LogLevel::ERROR, "[geosite] {}", msg);
+        msg
     })?;
 
     Ok(ConfigFileContent { path, content })
@@ -122,25 +128,34 @@ fn geosite_cache_path(name: &str, url: &str) -> String {
         if !config_ptr.is_null() {
             let config = &*config_ptr;
             if !config.data_dir.is_empty() {
-                std::ffi::CStr::from_ptr(config.data_dir.as_ptr())
+                let dir = std::ffi::CStr::from_ptr(config.data_dir.as_ptr())
                     .to_string_lossy()
-                    .into_owned()
+                    .into_owned();
+                dns_log!(LogLevel::DEBUG, "[geosite] geosite_cache_path: data_dir from C config = '{}'", dir);
+                dir
             } else {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-                cwd.join("data").to_string_lossy().into_owned()
+                let dir = std::env::current_dir().unwrap_or_else(|_| "/".into())
+                    .join("data").to_string_lossy().into_owned();
+                dns_log!(LogLevel::DEBUG, "[geosite] geosite_cache_path: C config data_dir is empty, fallback to cwd/data = '{}'", dir);
+                dir
             }
         } else {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-            cwd.join("data").to_string_lossy().into_owned()
+            let dir = std::env::current_dir().unwrap_or_else(|_| "/".into())
+                .join("data").to_string_lossy().into_owned();
+            dns_log!(LogLevel::DEBUG, "[geosite] geosite_cache_path: geosite_get_updater_config() returned NULL, fallback to cwd/data = '{}'", dir);
+            dir
         }
     };
 
     let (url_domain, url_filename) = extract_url_parts(url);
-    if !url_filename.is_empty() {
+    let cache = if !url_filename.is_empty() {
         format!("{}/{}-{}", data_dir, url_domain, url_filename)
     } else {
         format!("{}/geosite-{}.list", data_dir, name)
-    }
+    };
+    dns_log!(LogLevel::DEBUG, "[geosite] geosite_cache_path: name='{}', url='{}', cache='{}'",
+        name, url, cache);
+    cache
 }
 
 /// Parse geosite-dat directives from config content.
@@ -195,7 +210,14 @@ pub fn parse_geosite_list(config_content: &str) -> Vec<GeositeFileInfo> {
 /// Falls back to parsing the main config file content.
 pub fn get_geosite_list() -> Result<Vec<GeositeFileInfo>, Box<dyn Error>> {
     let conf = read_main_config()?;
+    dns_log!(LogLevel::DEBUG, "[geosite] get_geosite_list: config_path='{}', config_size={} bytes",
+        conf.path, conf.content.len());
     let files = parse_geosite_list(&conf.content);
+    dns_log!(LogLevel::DEBUG, "[geosite] get_geosite_list: parsed {} geosite-dat entries", files.len());
+    for f in &files {
+        dns_log!(LogLevel::DEBUG, "[geosite]   - name='{}', source='{}', path='{}', cache_path={:?}",
+            f.name, f.source, f.path, f.cache_path);
+    }
     Ok(files)
 }
 
@@ -215,7 +237,9 @@ pub fn get_geosite_file_metadata(path: &str) -> Result<GeositeFileMetadata, Box<
     let resolved_path = if path.starts_with('/') {
         path.to_string()
     } else {
-        geosite_resolve_dat_path(path)
+        let resolved = geosite_resolve_dat_path(path);
+        dns_log!(LogLevel::DEBUG, "[geosite] get_geosite_file_metadata: '{}' -> '{}'", path, resolved);
+        resolved
     };
 
     let metadata = fs::metadata(&resolved_path).map_err(|e| {

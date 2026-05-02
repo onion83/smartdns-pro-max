@@ -146,6 +146,11 @@ int geosite_download_url_files_sync(void);
  * to force full re-download (bypasses 304 Not Modified). */
 int geosite_download_url_files_sync_force(void);
 
+/* Synchronously download a single URL-based geosite-dat file by name.
+ * If force is non-zero, clears the ETag for that entry first.
+ * Returns 0 on success, -1 if not found or not a URL source. */
+int geosite_download_single_url_file_sync(const char *name, int force);
+
 /* Reload geosite rules into ART tree (called on main thread after download completes) */
 int geosite_reload_rules(void);
 

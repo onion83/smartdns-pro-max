@@ -355,6 +355,21 @@ pub fn geosite_download_url_files_sync_force() -> Result<(), String> {
     }
 }
 
+/// Synchronously download a single URL-based geosite-dat file by name.
+/// If force is true, clears the ETag for that entry before downloading.
+/// Blocks until download completes and rules are reloaded.
+pub fn geosite_download_single_url_file_sync(name: &str, force: bool) -> Result<(), String> {
+    let c_name = CString::new(name).expect("Failed to convert name to CString");
+    unsafe {
+        let ret = smartdns_c::geosite_download_single_url_file_sync(c_name.as_ptr(), if force { 1 } else { 0 });
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(format!("geosite download failed for '{}'", name))
+        }
+    }
+}
+
 pub fn geosite_resolve_dat_path(path: &str) -> String {
     let path = CString::new(path).expect("Failed to convert to CString");
     unsafe {

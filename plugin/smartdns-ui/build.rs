@@ -95,6 +95,7 @@ fn link_smartdns_lib() {
         .allowlist_function("geosite_get_updater_config")
         .allowlist_function("geosite_download_url_files_sync")
         .allowlist_function("geosite_download_url_files_sync_force")
+        .allowlist_function("geosite_download_single_url_file_sync")
         .allowlist_type("geosite_updater_config")
         .generate()
         .expect("Unable to generate geosite bindings");

@@ -1424,6 +1424,8 @@ static int _geosite_dat_update(struct geosite_dat *dat)
  * Reuses:
  *   - _geosite_download_one_url()  for URL sources (download+normalize)
  *   - _geosite_dat_update()        for local file change detection (mtime/hash) */
+static int _geosite_reload_rules_internal(int skip_mtime_check);
+
 int geosite_download_url_files_sync(void)
 {
 	struct geosite_dat *dat = NULL;
@@ -1471,7 +1473,7 @@ int geosite_download_url_files_sync(void)
 	}
 
 	/* Reload rules if any files were updated */
-	return geosite_reload_rules();
+	return _geosite_reload_rules_internal(1);
 }
 
 /* Same as geosite_download_url_files_sync() but clears all ETags first
@@ -1490,6 +1492,60 @@ int geosite_download_url_files_sync_force(void)
 	}
 
 	return geosite_download_url_files_sync();
+}
+
+/* Synchronously download a single URL-based geosite-dat file by name.
+ * If force is non-zero, clears the ETag for that entry first.
+ * Returns 0 on success, -1 if not found or not a URL source, or download error. */
+int geosite_download_single_url_file_sync(const char *name, int force)
+{
+	struct geosite_dat *dat = _geosite_dat_find_by_name(name);
+
+	if (dat == NULL) {
+		tlog(TLOG_ERROR, "geosite-dat '%s': not found in config", name);
+		return -1;
+	}
+
+	if (!dat->is_url) {
+		tlog(TLOG_ERROR, "geosite-dat '%s': is a local file, cannot download", name);
+		return -1;
+	}
+
+	if (force) {
+		dat->etag[0] = '\0';
+	}
+
+	tlog(TLOG_INFO, "geosite: sync downloading %s from %s...", dat->name, dat->url);
+	char new_etag[128] = {0};
+	int dl_ret = _geosite_download_one_url(dat, new_etag);
+
+	if (dl_ret == 1) {
+		/* 304 Not Modified */
+		dat->last_update = time(NULL);
+		if (new_etag[0]) {
+			safe_strncpy(dat->etag, new_etag, sizeof(dat->etag));
+		}
+		tlog(TLOG_INFO, "geosite-dat %s: not modified (304)", dat->name);
+		return 0;
+	}
+
+	if (dl_ret != 0) {
+		tlog(TLOG_ERROR, "geosite-dat %s: sync download failed after %d retries", dat->name,
+			 geosite_updater.http_retry + 1);
+		return -1;
+	}
+
+	/* Download succeeded — update ETag and mark for reload */
+	if (new_etag[0]) {
+		safe_strncpy(dat->etag, new_etag, sizeof(dat->etag));
+	}
+
+	dat->need_update = 1;
+	dat->last_update = time(NULL);
+	tlog(TLOG_INFO, "geosite-dat %s: sync download complete, file updated", dat->name);
+
+	/* Reload rules (skip mtime re-check, download already confirmed) */
+	return _geosite_reload_rules_internal(1);
 }
 
 /* Check all geosite data sources and trigger async downloads if needed.
@@ -1593,12 +1649,11 @@ int geosite_check_and_download(void)
 	return 0;
 }
 
-/* Reload geosite rules into ART tree.
- * Called from main thread after receiving download-complete eventfd notification,
- * or after local file mtime change detected by geosite_check_and_download().
- * This function handles the ART tree operations (delete stale + re-add) and
- * is safe to call from the main epoll thread. */
-int geosite_reload_rules(void)
+/* Reload geosite rules into ART tree (internal, with mtime check control).
+ * When skip_mtime_check is set, the mtime verification for URL sources is bypassed.
+ * This is used by synchronous download paths where the file has already been
+ * written and confirmed, avoiding a race between time(NULL) and stat().st_mtime. */
+static int _geosite_reload_rules_internal(int skip_mtime_check)
 {
 	struct geosite_dat *dat = NULL;
 	struct hlist_node *tmp = NULL;
@@ -1618,9 +1673,10 @@ int geosite_reload_rules(void)
 	}
 
 	/* For URL sources, check if download has completed by verifying file mtime */
-	hash_for_each_safe(geosite_dat_table.dats, i, tmp, dat, node)
-	{
-		if (dat->need_update && dat->is_url) {
+	if (!skip_mtime_check) {
+		hash_for_each_safe(geosite_dat_table.dats, i, tmp, dat, node)
+		{
+			if (dat->need_update && dat->is_url) {
 			struct stat st;
 			if (stat(dat->file, &st) == 0 && (unsigned int)st.st_mtime != dat->last_update) {
 				dat->last_update = st.st_mtime;
@@ -1635,6 +1691,8 @@ int geosite_reload_rules(void)
 			}
 		}
 	}
+
+	} /* end skip_mtime_check block */
 
 	/* Re-check after clearing stale flags */
 	has_update = 0;
@@ -1790,6 +1848,12 @@ int geosite_reload_rules(void)
 		 total_added, total_deleted);
 
 	return 0;
+}
+
+/* Public wrapper: reload with mtime check (for async/eventfd path). */
+int geosite_reload_rules(void)
+{
+	return _geosite_reload_rules_internal(0);
 }
 
 /* Iterate domains in a geosite-set */

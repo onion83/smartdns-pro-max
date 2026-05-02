@@ -1406,46 +1406,40 @@ impl API {
     }
 
     /// Read a geosite file content <br>
-    /// API: GET /api/config/geosite/file?path=<path>
-    /// For remote sources, use cache_path parameter to read the cached local file.
+    /// API: GET /api/config/geosite/file?tag=<tag>
+    /// The tag identifies the geosite-dat entry; the backend resolves the path internally.
     async fn api_config_geosite_get_file(
         this: Arc<HttpServer>,
         _param: APIRouteParam,
         req: Request<body::Incoming>,
     ) -> Result<Response<Full<Bytes>>, HttpError> {
         let params = API::get_params(&req);
-        let path = API::params_get_value(&params, "path");
-        if path.is_none() {
-            return API::response_error(StatusCode::BAD_REQUEST, "Missing parameter: path");
+        let tag = API::params_get_value(&params, "tag");
+        if tag.is_none() {
+            return API::response_error(StatusCode::BAD_REQUEST, "Missing parameter: tag");
         }
 
-        let path: String = path.unwrap();
+        let tag: String = tag.unwrap();
 
-        // For remote URLs, try to read the cache file instead
-        let file_to_read: String = if path.starts_with("http://") || path.starts_with("https://") {
-            // Check for cache_path parameter
-            if let Some(cache_path) = API::params_get_value(&params, "cache_path") {
-                cache_path
-            } else {
-                return API::response_error(
-                    StatusCode::BAD_REQUEST,
-                    "Remote source requires cache_path parameter",
-                );
-            }
-        } else {
-            path.clone()
-        };
+        let tag_for_response = tag.clone();
 
-        let path_for_response = path.clone();
-        let this_clone = this.clone();
-        let file_to_read_for_meta = file_to_read.clone();
-
+        // Resolve tag -> (resolved_path, source, cache_path) via get_geosite_list
         let ret = API::call_blocking(this, move || {
-            let result = file_ops::read_geosite_file(&file_to_read);
-            if let Err(e) = result {
-                return Err(e.to_string());
-            }
-            Ok(result.unwrap())
+            let files = file_ops::get_geosite_list().map_err(|e| e.to_string())?;
+            let file = files.into_iter().find(|f| f.name == tag)
+                .ok_or_else(|| format!("Geosite file '{}' not found in config", tag))?;
+
+            let file_to_read = if file.source == "remote" {
+                file.cache_path.as_ref()
+                    .ok_or_else(|| format!("Remote geosite '{}' has no cache_path (file not yet downloaded)", file.name))?
+                    .clone()
+            } else {
+                file.path.clone()
+            };
+
+            let content = file_ops::read_geosite_file(&file_to_read).map_err(|e| e.to_string())?;
+            let file_info = file_ops::get_geosite_file_metadata(&file_to_read).ok();
+            Ok::<_, String>((content, file_info, file))
         })
         .await;
 
@@ -1456,25 +1450,19 @@ impl API {
             );
         }
 
-        let ret = ret.unwrap();
-        if let Err(e) = ret {
+        let inner = ret.unwrap();
+        if let Err(e) = inner {
             return API::response_error(
                 StatusCode::NOT_FOUND,
                 e.to_string().as_str(),
             );
         }
 
-        let content = ret.unwrap();
-
-        // Get file metadata (path, size, modified time)
-        let file_info = API::call_blocking(this_clone, move || {
-            file_ops::get_geosite_file_metadata(&file_to_read_for_meta).ok()
-        })
-        .await
-        .unwrap_or(None);
+        let (content, file_info, file_info_entry) = inner.unwrap();
 
         let body = serde_json::json!({
-            "path": path_for_response,
+            "tag": tag_for_response,
+            "path": file_info_entry.path,
             "content": content,
             "file_info": file_info,
         })
@@ -1484,8 +1472,8 @@ impl API {
     }
 
     /// Write a geosite file content <br>
-    /// API: PUT /api/config/geosite/file?path=<path> <br>
-    /// For remote sources, use cache_path parameter to write to the cached local file.
+    /// API: PUT /api/config/geosite/file?tag=<tag> <br>
+    /// The tag identifies the geosite-dat entry; the backend resolves the path internally.
     /// Body: { "content": "..." }
     async fn api_config_geosite_put_file(
         this: Arc<HttpServer>,
@@ -1493,26 +1481,12 @@ impl API {
         req: Request<body::Incoming>,
     ) -> Result<Response<Full<Bytes>>, HttpError> {
         let params = API::get_params(&req);
-        let path = API::params_get_value(&params, "path");
-        if path.is_none() {
-            return API::response_error(StatusCode::BAD_REQUEST, "Missing parameter: path");
+        let tag = API::params_get_value(&params, "tag");
+        if tag.is_none() {
+            return API::response_error(StatusCode::BAD_REQUEST, "Missing parameter: tag");
         }
 
-        let path: String = path.unwrap();
-
-        // For remote URLs, write to cache file instead
-        let file_to_write: String = if path.starts_with("http://") || path.starts_with("https://") {
-            if let Some(cache_path) = API::params_get_value(&params, "cache_path") {
-                cache_path
-            } else {
-                return API::response_error(
-                    StatusCode::BAD_REQUEST,
-                    "Remote source requires cache_path parameter",
-                );
-            }
-        } else {
-            path.clone()
-        };
+        let tag: String = tag.unwrap();
 
         let whole_body =
             String::from_utf8(req.into_body().collect().await?.to_bytes().into())?;
@@ -1530,6 +1504,19 @@ impl API {
         let content = content.unwrap().to_string();
 
         let ret = API::call_blocking(this, move || {
+            // Resolve tag -> file path via get_geosite_list
+            let files = file_ops::get_geosite_list().map_err(|e| e.to_string())?;
+            let file = files.into_iter().find(|f| f.name == tag)
+                .ok_or_else(|| format!("Geosite file '{}' not found in config", tag))?;
+
+            let file_to_write = if file.source == "remote" {
+                file.cache_path.as_ref()
+                    .ok_or_else(|| format!("Remote geosite '{}' has no cache_path", file.name))?
+                    .clone()
+            } else {
+                file.path.clone()
+            };
+
             let result = file_ops::write_geosite_file(&file_to_write, &content);
             if let Err(e) = result {
                 return Err(e.to_string());
@@ -1556,48 +1543,97 @@ impl API {
         API::response_build(StatusCode::OK, "{}".to_string())
     }
 
-    /// Trigger download of all remote geosite-dat files <br>
-    /// API: POST /api/config/geosite/download <br>
+    /// Trigger download of remote geosite-dat files <br>
+    /// API: POST /api/config/geosite/download[?tag=<name>] <br>
+    /// Without tag: downloads all URL-based geosite-dat sources and reloads rules. <br>
+    /// With tag: downloads only the specified remote geosite-dat source. <br>
     /// Synchronously downloads all URL-based geosite-dat sources and reloads rules.
-    /// Body (optional): { "names": ["name1", "name2"] } — if provided, only download specific sources.
     /// Returns: { "message": "..." }
     async fn api_config_geosite_download(
         this: Arc<HttpServer>,
         _param: APIRouteParam,
-        _req: Request<body::Incoming>,
+        req: Request<body::Incoming>,
     ) -> Result<Response<Full<Bytes>>, HttpError> {
-        // For now, we download ALL URL sources (C side doesn't support single-name download)
-        // This is acceptable since geosite_download_url_files_sync handles ETag/304 efficiently.
-        let ret = API::call_blocking(this, move || {
-            let result = smartdns::geosite_download_url_files_sync_force();
-            if let Err(e) = result {
-                return Err(e);
+        let params = API::get_params(&req);
+        let tag: Option<String> = API::params_get_value(&params, "tag");
+
+        if let Some(tag) = tag {
+            // Single-file download: resolve tag -> download only that URL source
+            let tag_owned = tag.clone();
+            let ret = API::call_blocking(this, move || {
+                let files = file_ops::get_geosite_list().map_err(|e| e.to_string())?;
+                let file = files.into_iter().find(|f| f.name == tag_owned)
+                    .ok_or_else(|| format!("Geosite file '{}' not found in config", tag_owned))?;
+
+                if file.source != "remote" {
+                    return Err(format!("Geosite '{}' is a local file, cannot download", tag_owned));
+                }
+
+                dns_log!(crate::smartdns::LogLevel::INFO,
+                    "[geosite] Downloading single file: tag='{}'", tag_owned);
+
+                let result = smartdns::geosite_download_single_url_file_sync(&tag_owned, true);
+                if let Err(e) = result {
+                    return Err(e);
+                }
+                Ok(())
+            })
+            .await;
+
+            if let Err(e) = ret {
+                return API::response_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().as_str(),
+                );
             }
-            Ok(())
-        })
-        .await;
 
-        if let Err(e) = ret {
-            return API::response_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                e.to_string().as_str(),
-            );
+            let ret = ret.unwrap();
+            if let Err(e) = ret {
+                return API::response_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().as_str(),
+                );
+            }
+
+            let body = serde_json::json!({
+                "message": format!("Geosite '{}' download completed successfully", tag),
+            })
+            .to_string();
+
+            API::response_build(StatusCode::OK, body)
+        } else {
+            // Full download: download all URL sources
+            let ret = API::call_blocking(this, move || {
+                let result = smartdns::geosite_download_url_files_sync_force();
+                if let Err(e) = result {
+                    return Err(e);
+                }
+                Ok(())
+            })
+            .await;
+
+            if let Err(e) = ret {
+                return API::response_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().as_str(),
+                );
+            }
+
+            let ret = ret.unwrap();
+            if let Err(e) = ret {
+                return API::response_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().as_str(),
+                );
+            }
+
+            let body = serde_json::json!({
+                "message": "Geosite download completed successfully",
+            })
+            .to_string();
+
+            API::response_build(StatusCode::OK, body)
         }
-
-        let ret = ret.unwrap();
-        if let Err(e) = ret {
-            return API::response_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                e.to_string().as_str(),
-            );
-        }
-
-        let body = serde_json::json!({
-            "message": "Geosite download completed successfully",
-        })
-        .to_string();
-
-        API::response_build(StatusCode::OK, body)
     }
 
     async fn call_blocking<F, R>(

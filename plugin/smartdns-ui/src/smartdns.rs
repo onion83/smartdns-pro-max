@@ -383,7 +383,7 @@ pub fn geosite_dat_list_to_json() -> Result<String, String> {
             .to_string_lossy()
             .into_owned();
         // Free the C-allocated string (malloc'd in geosite.c, use libc free)
-        unsafe { nix::libc::free(ptr as *mut std::ffi::c_void) };
+        nix::libc::free(ptr as *mut std::ffi::c_void);
         Ok(s)
     }
 }

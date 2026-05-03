@@ -1625,6 +1625,8 @@ int geosite_check_and_download(void)
 				dat->need_update = 1;
 				/* For local files, reload immediately in the next step */
 			} else {
+				/* File not changed, reset interval timer to avoid repeated checks */
+				dat->last_update = time(NULL);
 				tlog(TLOG_DEBUG, "geosite-dat %s: file no change", dat->name);
 			}
 		}

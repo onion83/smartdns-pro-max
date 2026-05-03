@@ -1682,9 +1682,12 @@ static int _geosite_reload_rules_internal(int skip_mtime_check)
 				dat->last_update = st.st_mtime;
 				tlog(TLOG_DEBUG, "geosite-dat %s: URL file updated (new_mtime=%u)", dat->name, dat->last_update);
 			} else {
-				/* File not actually changed, clear flag */
+				/* File not actually changed (or stat failed), clear flag.
+				 * Update last_update to time(NULL) to reset the interval timer,
+				 * preventing immediate re-download on the next periodic check. */
 				dat->need_update = 0;
 				dat->downloading = 0;
+				dat->last_update = time(NULL);
 				const char *algo_name = (geosite_updater.diff_algo == GEOSITE_DIFF_CRC32) ? "crc32" :
 				                        (geosite_updater.diff_algo == GEOSITE_DIFF_MD5)   ? "md5" : "mtime";
 				tlog(TLOG_DEBUG, "geosite-dat %s: URL file no change (%s)", dat->name, algo_name);

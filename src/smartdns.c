@@ -21,6 +21,7 @@
 #include "smartdns/smartdns.h"
 
 #include "dns_conf/geosite.h"
+#include "dns_conf/domain_rule.h"
 #include "smartdns/lib/art.h"
 #include "smartdns/lib/atomic.h"
 #include "smartdns/lib/hashtable.h"
@@ -46,6 +47,7 @@
 #include <sys/wait.h>
 #include <syslog.h>
 #include <ucontext.h>
+#include <unistd.h>
 
 #define MAX_KEY_LEN 64
 #define SMARTDNS_PID_FILE "/run/smartdns.pid"
@@ -1063,8 +1065,75 @@ static int smartdns_init_workdir(void)
 	 ((t) == DNS_SERVER_TLS) ? "tls://" : ((t) == DNS_SERVER_HTTPS) ? "https://" : \
 	 ((t) == DNS_SERVER_QUIC) ? "quic://" : ((t) == DNS_SERVER_HTTP3) ? "h3://" : "")
 
+static const char *_action_to_string(enum domain_rule_action action)
+{
+	switch (action) {
+	case DOMAIN_ACTION_ADDRESS: return "ADDRESS";
+	case DOMAIN_ACTION_NAMESERVER: return "NAMESERVER";
+	default: return "NONE";
+	}
+}
+
 /**
- * CLI: check which group a domain matches, show data sources + DNS servers.
+ * Print the full resolution chain from a domain_rule_resolve_chain struct.
+ */
+static void _print_resolve_chain(const struct domain_rule_resolve_chain *chain)
+{
+	printf("RESULT:\n-------------------------\n");
+	printf("%s -> [%s] -> %s", chain->domain, chain->rule_name, _action_to_string(chain->action));
+
+	switch (chain->action) {
+	case DOMAIN_ACTION_ADDRESS:
+		printf(" -> [\xe6\x9c\x80\xe7\xbb\x88\xe8\xbf\x94\xe5\x9b\x9e\xe7\xbb\x93\xe6\x9e\x9c] \xe9\x9d\x99\xe6\x80\x81\xe5\x9c\xb0\xe5\x9d\x80");
+		break;
+	case DOMAIN_ACTION_NAMESERVER:
+	case DOMAIN_ACTION_NONE:
+		if (chain->server_num > 0) {
+			printf(" -> %s (", chain->group_name);
+			for (int i = 0; i < chain->server_num; i++) {
+				if (i > 0) printf(" ");
+				printf("%s", chain->servers[i]);
+			}
+			printf(")");
+		}
+		if (chain->query_result_num > 0) {
+			printf(" -> [\xe8\x81\x9a\xe5\x90\x88\xe6\x9f\xa5\xe8\xaf\xa2\xe7\xbb\x93\xe6\x9e\x9c]\n");
+			for (int i = 0; i < chain->query_result_num; i++) {
+				const struct dns_server_query_result *qr = &chain->query_results[i];
+				if (qr->rcode < 0) {
+					printf("    %s: \xe8\xb6\x85\xe6\x97\xb6/\xe5\xa4\xb1\xe8\xb4\xa5\n", qr->server);
+				} else if (qr->rcode != 0) {
+					printf("    %s: rcode=%d\n", qr->server, qr->rcode);
+				} else if (qr->ip_count > 0) {
+					printf("    %s: %ums %s TTL=%u\n", qr->server, qr->ping_ms, qr->ips, qr->ttl);
+				} else if (qr->cname[0] != '\0') {
+					printf("    %s: %ums CNAME -> %s\n", qr->server, qr->ping_ms, qr->cname);
+				} else {
+					printf("    %s: %ums \xe7\xa9\xba\xe5\xba\x94\xe7\xad\x94\n", qr->server, qr->ping_ms);
+				}
+			}
+			printf(" -> [\xe6\x9c\x80\xe7\xbb\x88\xe8\xbf\x94\xe5\x9b\x9e\xe7\xbb\x93\xe6\x9e\x9c] ");
+			if (chain->final_ips[0] != '\0') {
+				printf("%s (from %s, %ums, TTL=%u)", chain->final_ips, chain->final_from, chain->final_ping_ms,
+					   chain->final_ttl);
+			} else if (chain->final_cname[0] != '\0') {
+				printf("CNAME -> %s (from %s, %ums)", chain->final_cname, chain->final_from, chain->final_ping_ms);
+			} else if (chain->final_rcode > 0) {
+				printf("rcode=%d (from %s)", chain->final_rcode, chain->final_from);
+			} else {
+				printf("\xe6\x97\xa0\xe5\x93\x8d\xe5\xba\x94");
+			}
+		} else {
+			printf(" -> [\xe6\x97\xa0\xe5\x8f\xaf\xe7\x94\xa8 UDP \xe6\x9c\x8d\xe5\x8a\xa1\xe5\x99\xa8]");
+		}
+		break;
+	}
+
+	printf("\n-------------------------\n");
+}
+
+/**
+ * CLI: check which rule a domain matches, show the full resolution chain.
  * Returns 0 on success (caller should return/exit).
  */
 static int _smartdns_check_domain_rule(const char *domain)
@@ -1096,53 +1165,15 @@ static int _smartdns_check_domain_rule(const char *domain)
 
 	tlog_setlevel(saved_level);
 
-	const char *group = dns_server_check_domain_rule(domain);
-
-	printf("RESULT:\n-------------------------\n%s -> %s", domain, group);
-
-	/* Show DNS servers in this group */
-	int _found = 0;
-
-	/* Try hash table first (named groups) */
-	uint32_t _gkey = hash_string(group);
-	struct dns_server_groups *_gsg = NULL;
-	hash_for_each_possible(dns_group_table.group, _gsg, node, _gkey)
-	{
-		if (strcmp(_gsg->group_name, group) == 0) {
-			_found = 1;
-			printf(" (");
-			for (int _si = 0; _si < _gsg->server_num && _si < DNS_MAX_SERVERS; _si++) {
-				if (_si > 0) printf(" ");
-				struct dns_servers *s = _gsg->servers[_si];
-				printf("%s%s", _DNS_TYPE_PREFIX(s->type), s->server);
-				if (s->port > 0 && s->port != DEFAULT_DNS_PORT)
-					printf(":%d", s->port);
-			}
-			printf(")");
-			break;
-		}
+	/* Build full resolution chain via structured API */
+	struct domain_rule_resolve_chain chain;
+	if (dns_conf_resolve_domain(domain, &chain) != 0) {
+		printf("RESULT:\n-------------------------\n%s -> [PASS] -> NONE -> check failed\n-------------------------\n", domain);
+		return -1;
 	}
 
-	/* Fallback: default group uses dns_conf.servers[] */
-	if (!_found && strcmp(group, "default") == 0) {
-		printf(" (");
-		int _first = 1;
-		for (int _si = 0; _si < dns_conf.server_num; _si++) {
-			struct dns_servers *s = &dns_conf.servers[_si];
-			if (s->server_flag & SERVER_FLAG_EXCLUDE_DEFAULT)
-				continue;
-			if (!_first) printf(" ");
-			_first = 0;
-			printf("%s%s", _DNS_TYPE_PREFIX(s->type), s->server);
-			if (s->port > 0 && s->port != DEFAULT_DNS_PORT)
-				printf(":%d", s->port);
-			if (s->fallback)
-				printf("*");
-		}
-		printf(")");
-	}
-
-	printf("\n-------------------------\n");
+	/* Output the chain from structured data */
+	_print_resolve_chain(&chain);
 	return 0;
 }
 

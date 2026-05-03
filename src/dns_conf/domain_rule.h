@@ -46,6 +46,11 @@ int _conf_domain_rule_speed_check(char *domain, const char *mode);
 int _conf_domain_rule_response_mode(char *domain, const char *mode);
 
 const char *dns_conf_check_domain_group(const char *domain);
+int dns_conf_check_domain_rule(const char *domain, struct domain_rule_check_result *result);
+void _domain_rule_auto_name_reset(void);
+
+/* Full resolution: rule match + actual DNS queries. Populates chain struct. */
+int dns_conf_resolve_domain(const char *domain, struct domain_rule_resolve_chain *chain);
 
 #ifdef __cplusplus
 }

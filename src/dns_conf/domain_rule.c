@@ -31,7 +31,12 @@
 #include "smartdns/util.h"
 #include "speed_check_mode.h"
 
+#include <arpa/inet.h>
 #include <getopt.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 static inline uint8_t _get_required_capacity(enum domain_rule type, uint8_t current_capacity)
 {
@@ -199,7 +204,91 @@ static struct dns_rule_info dns_rule_info_table[DOMAIN_RULE_MAX] = {
 	[DOMAIN_RULE_RESPONSE_MODE] = {sizeof(struct dns_response_mode_rule), NULL, NULL},
 	[DOMAIN_RULE_CNAME] = {sizeof(struct dns_cname_rule), NULL, NULL},
 	[DOMAIN_RULE_TTL] = {sizeof(struct dns_ttl_rule), NULL, NULL},
+	[DOMAIN_RULE_NAME] = {sizeof(struct dns_name_rule), NULL, NULL},
 };
+
+/* Auto-name counter for unnamed domain rules, starts at 10000 */
+static int _domain_rule_auto_name_counter = 10000;
+
+void _domain_rule_auto_name_reset(void)
+{
+	_domain_rule_auto_name_counter = 10000;
+}
+
+struct _check_name_unique_ctx {
+	const char *target_name;
+	int found_duplicate;
+};
+
+static int _check_name_unique_cb(void *data, const unsigned char *key, uint32_t key_len, void *value)
+{
+	struct _check_name_unique_ctx *ctx = (struct _check_name_unique_ctx *)data;
+	struct dns_domain_rule *domain_rule = (struct dns_domain_rule *)value;
+
+	if (DOMAIN_RULE_NAME < domain_rule->capacity && domain_rule->rules[DOMAIN_RULE_NAME] != NULL) {
+		struct dns_name_rule *name_rule = (struct dns_name_rule *)domain_rule->rules[DOMAIN_RULE_NAME];
+		if (name_rule->name != NULL && strcmp(name_rule->name, ctx->target_name) == 0) {
+			ctx->found_duplicate = 1;
+			return -1; /* stop iteration */
+		}
+	}
+	return 0; /* continue */
+}
+
+static int _check_domain_rule_name_unique(const char *name)
+{
+	struct dns_conf_group *rg = _config_current_rule_group();
+	if (rg == NULL || name == NULL) {
+		return 0;
+	}
+
+	struct _check_name_unique_ctx ctx = {.target_name = name, .found_duplicate = 0};
+	art_iter(&rg->domain_rule.tree, _check_name_unique_cb, &ctx);
+	return ctx.found_duplicate ? -1 : 0;
+}
+
+static int _conf_domain_rule_name(const char *domain, const char *name, char is_auto)
+{
+	struct dns_name_rule *name_rule = NULL;
+
+	if (name == NULL || strlen(name) == 0) {
+		return -1;
+	}
+
+	/* Check uniqueness */
+	if (!is_auto && _check_domain_rule_name_unique(name) != 0) {
+		tlog(TLOG_ERROR, "domain-rules '%s': name '%s' is already used, must be unique", domain, name);
+		return -1;
+	}
+
+	name_rule = _new_dns_rule(DOMAIN_RULE_NAME);
+	if (name_rule == NULL) {
+		tlog(TLOG_ERROR, "allocate memory for domain name rule failed.");
+		return -1;
+	}
+
+	name_rule->name = strdup(name);
+	if (name_rule->name == NULL) {
+		_dns_rule_put(&name_rule->head);
+		tlog(TLOG_ERROR, "strdup for domain name failed.");
+		return -1;
+	}
+	name_rule->is_auto = is_auto;
+
+	if (_config_domain_rule_add(domain, DOMAIN_RULE_NAME, name_rule) != 0) {
+		_dns_rule_put(&name_rule->head);
+		return -1;
+	}
+
+	return 0;
+}
+
+static const char *_get_domain_rule_auto_name(void)
+{
+	static char auto_name[32];
+	snprintf(auto_name, sizeof(auto_name), "drn-%d", _domain_rule_auto_name_counter++);
+	return auto_name;
+}
 
 void *_new_dns_rule_ext(enum domain_rule domain_rule, int ext_size)
 {
@@ -922,6 +1011,7 @@ int _config_domain_rules(void *data, int argc, char *argv[])
 	int rr_ttl_max = 0;
 	const char *group = NULL;
 	char group_name[DNS_MAX_CONF_CNAME_LEN];
+	int has_explicit_name = 0;
 
 
 
@@ -934,6 +1024,7 @@ int _config_domain_rules(void *data, int argc, char *argv[])
 		{"ipset", required_argument, NULL, 'p'},
 		{"nftset", required_argument, NULL, 't'},
 		{"nameserver", required_argument, NULL, 'n'},
+		{"name", required_argument, NULL, 'N'},
 		{"group", required_argument, NULL, 'g'},
 		{"dualstack-ip-selection", required_argument, NULL, 'd'},
 		{"cname", required_argument, NULL, 'A'},
@@ -1001,7 +1092,7 @@ int _config_domain_rules(void *data, int argc, char *argv[])
 	optind = 1;
 	optind_last = 1;
 	while (1) {
-		opt = getopt_long_only(argc, argv, "c:a:p:t:n:d:A:r:g:h:", long_options, NULL);
+		opt = getopt_long_only(argc, argv, "c:a:p:t:n:N:d:A:r:g:h:", long_options, NULL);
 		if (opt == -1) {
 			break;
 		}
@@ -1082,6 +1173,18 @@ int _config_domain_rules(void *data, int argc, char *argv[])
 				tlog(TLOG_ERROR, "add nameserver rule failed.");
 				goto errout;
 			}
+
+			break;
+		}
+		case 'N': {
+			if (optarg == NULL) {
+				goto errout;
+			}
+
+			if (_conf_domain_rule_name(domain, optarg, 0) != 0) {
+				goto errout;
+			}
+			has_explicit_name = 1;
 
 			break;
 		}
@@ -1202,6 +1305,12 @@ int _config_domain_rules(void *data, int argc, char *argv[])
 		_config_current_group_pop();
 	}
 
+	/* Auto-generate name if not explicitly set */
+	if (!has_explicit_name) {
+		const char *auto_name = _get_domain_rule_auto_name();
+		_conf_domain_rule_name(domain, auto_name, 1);
+	}
+
 	return 0;
 errout:
 	if (group != NULL) {
@@ -1234,49 +1343,171 @@ void *dns_conf_get_domain_rule(const char *domain, enum domain_rule type)
 	return domain_rule->rules[type];
 }
 
-const char *dns_conf_check_domain_group(const char *domain)
+static void _fill_dns_server_list(const char *group_name, struct domain_rule_check_result *result)
+{
+	result->server_num = 0;
+	memset(result->servers, 0, sizeof(result->servers));
+
+	if (group_name == NULL || group_name[0] == '\0') {
+		return;
+	}
+
+	safe_strncpy(result->group_name, group_name, DNS_GROUP_NAME_LEN);
+
+	/* Try named groups via hash table */
+	uint32_t gkey = hash_string(group_name);
+	struct dns_server_groups *gsg = NULL;
+	int found = 0;
+
+	hash_for_each_possible(dns_group_table.group, gsg, node, gkey)
+	{
+		if (strcmp(gsg->group_name, group_name) == 0) {
+			found = 1;
+			for (int i = 0; i < gsg->server_num && i < DNS_MAX_CHECK_SERVERS; i++) {
+				struct dns_servers *s = gsg->servers[i];
+				char prefix[16];
+				if (s->type == DNS_SERVER_UDP)
+					strncpy(prefix, "udp://", sizeof(prefix));
+				else if (s->type == DNS_SERVER_TCP)
+					strncpy(prefix, "tcp://", sizeof(prefix));
+				else if (s->type == DNS_SERVER_TLS)
+					strncpy(prefix, "tls://", sizeof(prefix));
+				else if (s->type == DNS_SERVER_HTTPS)
+					strncpy(prefix, "https://", sizeof(prefix));
+				else if (s->type == DNS_SERVER_QUIC)
+					strncpy(prefix, "quic://", sizeof(prefix));
+				else if (s->type == DNS_SERVER_HTTP3)
+					strncpy(prefix, "h3://", sizeof(prefix));
+				else
+					prefix[0] = '\0';
+
+				if (s->port > 0 && s->port != DEFAULT_DNS_PORT)
+					snprintf(result->servers[i], DNS_SERVER_INFO_STR_LEN, "%s%s:%d", prefix, s->server, s->port);
+				else
+					snprintf(result->servers[i], DNS_SERVER_INFO_STR_LEN, "%s%s", prefix, s->server);
+				result->server_num++;
+			}
+			break;
+		}
+	}
+
+	/* Fallback: default group uses dns_conf.servers[] */
+	if (!found && strcmp(group_name, "default") == 0) {
+		for (int i = 0; i < dns_conf.server_num && result->server_num < DNS_MAX_CHECK_SERVERS; i++) {
+			struct dns_servers *s = &dns_conf.servers[i];
+			if (s->server_flag & SERVER_FLAG_EXCLUDE_DEFAULT)
+				continue;
+
+			char prefix[16];
+			if (s->type == DNS_SERVER_UDP)
+				strncpy(prefix, "udp://", sizeof(prefix));
+			else if (s->type == DNS_SERVER_TCP)
+				strncpy(prefix, "tcp://", sizeof(prefix));
+			else if (s->type == DNS_SERVER_TLS)
+				strncpy(prefix, "tls://", sizeof(prefix));
+			else if (s->type == DNS_SERVER_HTTPS)
+				strncpy(prefix, "https://", sizeof(prefix));
+			else if (s->type == DNS_SERVER_QUIC)
+				strncpy(prefix, "quic://", sizeof(prefix));
+			else if (s->type == DNS_SERVER_HTTP3)
+				strncpy(prefix, "h3://", sizeof(prefix));
+			else
+				prefix[0] = '\0';
+
+			char server_str[DNS_SERVER_INFO_STR_LEN];
+			if (s->port > 0 && s->port != DEFAULT_DNS_PORT)
+				snprintf(server_str, sizeof(server_str), "%s%s:%d", prefix, s->server, s->port);
+			else
+				snprintf(server_str, sizeof(server_str), "%s%s", prefix, s->server);
+			if (s->fallback)
+				strncat(server_str, "*", sizeof(server_str) - strlen(server_str) - 1);
+
+			safe_strncpy(result->servers[result->server_num], server_str, DNS_SERVER_INFO_STR_LEN);
+			result->server_num++;
+		}
+	}
+}
+
+int dns_conf_check_domain_rule(const char *domain, struct domain_rule_check_result *result)
 {
 	struct dns_domain_rule *domain_rule = NULL;
-	struct dns_group_rule *group_rule = NULL;
-	struct dns_nameserver_rule *nameserver_rule = NULL;
 	struct dns_conf_group *conf_group = NULL;
 	char check_domain[DNS_MAX_CONF_CNAME_LEN];
 	char domain_key[DNS_MAX_CONF_CNAME_LEN] = {0};
 	int len = 0;
 	const char *p = NULL;
 
+	if (domain == NULL || result == NULL) {
+		return -1;
+	}
+
+	memset(result, 0, sizeof(*result));
+	safe_strncpy(result->domain, domain, DNS_MAX_CNAME_LEN);
+	safe_strncpy(result->rule_name, "PASS", DOMAIN_RULE_NAME_MAX_LEN);
+	safe_strncpy(result->group_name, "default", DNS_GROUP_NAME_LEN);
+	result->action = DOMAIN_ACTION_NONE;
+
 	/* Use default rule group for check-domain-rule command */
 	conf_group = dns_server_get_default_rule_group();
 	if (conf_group == NULL) {
-		return "default";
+		_fill_dns_server_list("default", result);
+		return 0;
 	}
 
 	/* Try exact match and each parent suffix: www.qq.com -> qq.com */
 	safe_strncpy(check_domain, domain, sizeof(check_domain));
 
-	for (p = check_domain; p && *p; ) {
+	for (p = check_domain; p && *p;) {
 		if (_config_setup_domain_key(p, domain_key, sizeof(domain_key), &len, NULL, NULL) != 0) {
 			break;
 		}
 
 		domain_rule = art_search(&conf_group->domain_rule.tree, (unsigned char *)domain_key, len);
 		if (domain_rule != NULL) {
-			/* Check GROUP rule (-g option) */
-			if (DOMAIN_RULE_GROUP < domain_rule->capacity) {
-				group_rule = (struct dns_group_rule *)domain_rule->rules[DOMAIN_RULE_GROUP];
-				if (group_rule != NULL && group_rule->group_name != NULL) {
-					return group_rule->group_name;
+			safe_strncpy(result->matched_pattern, p, DNS_MAX_CNAME_LEN);
+
+			/* Extract rule name */
+			if (DOMAIN_RULE_NAME < domain_rule->capacity && domain_rule->rules[DOMAIN_RULE_NAME] != NULL) {
+				struct dns_name_rule *name_rule = (struct dns_name_rule *)domain_rule->rules[DOMAIN_RULE_NAME];
+				if (name_rule->name != NULL) {
+					safe_strncpy(result->rule_name, name_rule->name, DOMAIN_RULE_NAME_MAX_LEN);
 				}
 			}
 
-			/* Also check NAMESERVER rule (-n option) */
-			if (DOMAIN_RULE_NAMESERVER < domain_rule->capacity) {
-				nameserver_rule =
-					(struct dns_nameserver_rule *)domain_rule->rules[DOMAIN_RULE_NAMESERVER];
-				if (nameserver_rule != NULL && nameserver_rule->group_name != NULL) {
-					return nameserver_rule->group_name;
+			/* Determine action: ADDRESS takes priority */
+			if (DOMAIN_RULE_ADDRESS_IPV4 < domain_rule->capacity && domain_rule->rules[DOMAIN_RULE_ADDRESS_IPV4] != NULL) {
+				result->action = DOMAIN_ACTION_ADDRESS;
+				return 0;
+			}
+			if (DOMAIN_RULE_ADDRESS_IPV6 < domain_rule->capacity && domain_rule->rules[DOMAIN_RULE_ADDRESS_IPV6] != NULL) {
+				result->action = DOMAIN_ACTION_ADDRESS;
+				return 0;
+			}
+
+			/* Check NAMESERVER / GROUP for NAMESERVER action */
+			const char *group = NULL;
+			if (DOMAIN_RULE_GROUP < domain_rule->capacity && domain_rule->rules[DOMAIN_RULE_GROUP] != NULL) {
+				struct dns_group_rule *gr = (struct dns_group_rule *)domain_rule->rules[DOMAIN_RULE_GROUP];
+				if (gr->group_name != NULL) {
+					group = gr->group_name;
 				}
 			}
+			if (group == NULL && DOMAIN_RULE_NAMESERVER < domain_rule->capacity &&
+				domain_rule->rules[DOMAIN_RULE_NAMESERVER] != NULL) {
+				struct dns_nameserver_rule *nr =
+					(struct dns_nameserver_rule *)domain_rule->rules[DOMAIN_RULE_NAMESERVER];
+				if (nr->group_name != NULL) {
+					group = nr->group_name;
+				}
+			}
+
+			if (group != NULL) {
+				result->action = DOMAIN_ACTION_NAMESERVER;
+				_fill_dns_server_list(group, result);
+				return 0;
+			}
+
+			/* Matched a rule but no action (e.g., flags-only rule), continue to parent */
 		}
 
 		/* Move to next parent domain */
@@ -1286,6 +1517,254 @@ const char *dns_conf_check_domain_group(const char *domain)
 		}
 	}
 
-	return "default";
+	/* No match: fill default servers */
+	_fill_dns_server_list("default", result);
+	return 0;
+}
+
+const char *dns_conf_check_domain_group(const char *domain)
+{
+	static struct domain_rule_check_result _result;
+	if (dns_conf_check_domain_rule(domain, &_result) != 0) {
+		return "default";
+	}
+	return _result.group_name[0] ? _result.group_name : "default";
+}
+
+/* ---- Domain resolution chain implementation ---- */
+
+#define RESOLVE_DNS_TIMEOUT_MS 3000
+
+/* Parse "udp://1.2.3.4:53" or "udp://1.2.3.4" into (ip, port). */
+static void _parse_server_addr(const char *server_str, char *ip, int ip_len, int *port)
+{
+	const char *p = strstr(server_str, "://");
+	p = p ? p + 3 : server_str;
+
+	char buf[DNS_MAX_IPLEN];
+	safe_strncpy(buf, p, sizeof(buf));
+	char *colon = strrchr(buf, ':');
+	if (colon) {
+		*colon = '\0';
+		*port = atoi(colon + 1);
+	} else {
+		*port = 53;
+	}
+	safe_strncpy(ip, buf, ip_len);
+}
+
+/* Send a UDP DNS query, return response length or -1. */
+static int _resolve_udp_query(const char *server_ip, int server_port, const char *domain, int qtype,
+							  unsigned char *response, int response_len, unsigned int *ping_ms)
+{
+	int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sockfd < 0) {
+		return -1;
+	}
+
+	struct timeval tv = {.tv_sec = RESOLVE_DNS_TIMEOUT_MS / 1000,
+						.tv_usec = (RESOLVE_DNS_TIMEOUT_MS % 1000) * 1000};
+	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	/* Build query */
+	unsigned char pkt_buf[DNS_IN_PACKSIZE + sizeof(struct dns_packet) + 64];
+	struct dns_packet *packet = (struct dns_packet *)pkt_buf;
+	memset(pkt_buf, 0, sizeof(pkt_buf));
+	struct dns_head head = {.id = (unsigned short)(random() & 0xFFFF), .rd = 1, .qdcount = 1};
+	dns_packet_init(packet, sizeof(pkt_buf), &head);
+	dns_add_domain(packet, domain, qtype, DNS_C_IN);
+
+	unsigned char wire[DNS_IN_PACKSIZE];
+	int wire_len = dns_encode(wire, sizeof(wire), packet);
+	if (wire_len < 0) {
+		close(sockfd);
+		return -1;
+	}
+
+	struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(server_port)};
+	inet_pton(AF_INET, server_ip, &addr.sin_addr);
+
+	unsigned long start = get_tick_count();
+	if (sendto(sockfd, wire, wire_len, 0, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(sockfd);
+		return -1;
+	}
+
+	struct pollfd pfd = {.fd = sockfd, .events = POLLIN};
+	if (poll(&pfd, 1, RESOLVE_DNS_TIMEOUT_MS) <= 0) {
+		close(sockfd);
+		return -1;
+	}
+
+	socklen_t alen = sizeof(addr);
+	int rlen = recvfrom(sockfd, response, response_len, 0, (struct sockaddr *)&addr, &alen);
+	*ping_ms = get_tick_count() - start;
+	close(sockfd);
+	return rlen;
+}
+
+/* Parse DNS response into a query result struct. */
+static void _resolve_parse_response(unsigned char *data, int data_len, struct dns_server_query_result *qr)
+{
+	unsigned char buf[DNS_IN_PACKSIZE + sizeof(struct dns_packet) + 64];
+	struct dns_packet *packet = (struct dns_packet *)buf;
+	memset(buf, 0, sizeof(buf));
+
+	if (dns_decode(packet, sizeof(buf), data, data_len) < 0) {
+		qr->rcode = -1;
+		return;
+	}
+
+	qr->rcode = packet->head.rcode;
+	qr->ips[0] = '\0';
+	qr->cname[0] = '\0';
+	qr->ip_count = 0;
+	qr->ttl = 0;
+
+	int ancount = 0;
+	struct dns_rrs *rrs = dns_get_rrs_start(packet, DNS_RRS_AN, &ancount);
+	while (rrs) {
+		char rr_domain[DNS_MAX_CNAME_LEN];
+		int rr_ttl = 0;
+
+		switch (rrs->type) {
+		case DNS_T_A: {
+			unsigned char addr[DNS_RR_A_LEN];
+			if (dns_get_A(rrs, rr_domain, sizeof(rr_domain), &rr_ttl, addr) == 0) {
+				char ip_str[INET_ADDRSTRLEN];
+				inet_ntop(AF_INET, addr, ip_str, sizeof(ip_str));
+				if (qr->ip_count > 0)
+					strlcat(qr->ips, ", ", sizeof(qr->ips));
+				strlcat(qr->ips, ip_str, sizeof(qr->ips));
+				qr->ip_count++;
+				qr->ttl = rr_ttl;
+			}
+			break;
+		}
+		case DNS_T_AAAA: {
+			unsigned char addr[DNS_RR_AAAA_LEN];
+			if (dns_get_AAAA(rrs, rr_domain, sizeof(rr_domain), &rr_ttl, addr) == 0) {
+				char ip_str[INET6_ADDRSTRLEN];
+				inet_ntop(AF_INET6, addr, ip_str, sizeof(ip_str));
+				if (qr->ip_count > 0)
+					strlcat(qr->ips, ", ", sizeof(qr->ips));
+				strlcat(qr->ips, ip_str, sizeof(qr->ips));
+				qr->ip_count++;
+				qr->ttl = rr_ttl;
+			}
+			break;
+		}
+		case DNS_T_CNAME: {
+			char cname[DNS_MAX_CNAME_LEN];
+			if (dns_get_CNAME(rrs, rr_domain, sizeof(rr_domain), &rr_ttl, cname, sizeof(cname)) == 0) {
+				safe_strncpy(qr->cname, cname, sizeof(qr->cname));
+			}
+			break;
+		}
+		default:
+			break;
+		}
+		rrs = dns_get_rrs_next(packet, rrs);
+	}
+}
+
+/* Populate chain->query_results[] by querying all UDP servers. */
+static void _resolve_query_servers(const char *domain, struct domain_rule_resolve_chain *chain)
+{
+	chain->query_result_num = 0;
+	chain->final_rcode = -1;
+	chain->final_ips[0] = '\0';
+	chain->final_cname[0] = '\0';
+	chain->final_from[0] = '\0';
+	chain->final_ttl = 0;
+	chain->final_ping_ms = 0;
+
+	for (int i = 0; i < chain->server_num && chain->query_result_num < DNS_MAX_CHECK_SERVERS; i++) {
+		/* Only query UDP servers */
+		if (strncmp(chain->servers[i], "udp://", 6) != 0) {
+			continue;
+		}
+
+		char ip[DNS_MAX_IPLEN];
+		int port = 53;
+		_parse_server_addr(chain->servers[i], ip, sizeof(ip), &port);
+
+		struct dns_server_query_result *qr = &chain->query_results[chain->query_result_num];
+		safe_strncpy(qr->server, chain->servers[i], sizeof(qr->server));
+
+		unsigned char response[DNS_IN_PACKSIZE];
+		int rlen = _resolve_udp_query(ip, port, domain, DNS_T_A, response, sizeof(response), &qr->ping_ms);
+		if (rlen > 0) {
+			_resolve_parse_response(response, rlen, qr);
+		} else {
+			qr->rcode = -1;
+		}
+		chain->query_result_num++;
+	}
+
+	/* Select final result: prefer first server with IPs, then CNAME, then first rcode */
+	for (int i = 0; i < chain->query_result_num; i++) {
+		struct dns_server_query_result *qr = &chain->query_results[i];
+		if (qr->rcode == 0 && qr->ip_count > 0) {
+			chain->final_rcode = 0;
+			safe_strncpy(chain->final_ips, qr->ips, sizeof(chain->final_ips));
+			safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
+			chain->final_ttl = qr->ttl;
+			chain->final_ping_ms = qr->ping_ms;
+			return;
+		}
+	}
+	for (int i = 0; i < chain->query_result_num; i++) {
+		struct dns_server_query_result *qr = &chain->query_results[i];
+		if (qr->rcode == 0 && qr->cname[0] != '\0') {
+			chain->final_rcode = 0;
+			safe_strncpy(chain->final_cname, qr->cname, sizeof(chain->final_cname));
+			safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
+			chain->final_ping_ms = qr->ping_ms;
+			return;
+		}
+	}
+	for (int i = 0; i < chain->query_result_num; i++) {
+		struct dns_server_query_result *qr = &chain->query_results[i];
+		if (qr->rcode != 0 && qr->rcode != -1) {
+			chain->final_rcode = qr->rcode;
+			safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
+			return;
+		}
+	}
+}
+
+int dns_conf_resolve_domain(const char *domain, struct domain_rule_resolve_chain *chain)
+{
+	if (domain == NULL || chain == NULL) {
+		return -1;
+	}
+
+	memset(chain, 0, sizeof(*chain));
+
+	/* Phase 1+2: rule matching (reuse existing function) */
+	struct domain_rule_check_result rule_result;
+	if (dns_conf_check_domain_rule(domain, &rule_result) != 0) {
+		safe_strncpy(chain->domain, domain, DNS_MAX_CNAME_LEN);
+		safe_strncpy(chain->rule_name, "PASS", DOMAIN_RULE_NAME_MAX_LEN);
+		chain->action = DOMAIN_ACTION_NONE;
+		return -1;
+	}
+
+	/* Copy rule match results into chain */
+	safe_strncpy(chain->domain, rule_result.domain, DNS_MAX_CNAME_LEN);
+	safe_strncpy(chain->rule_name, rule_result.rule_name, DOMAIN_RULE_NAME_MAX_LEN);
+	safe_strncpy(chain->matched_pattern, rule_result.matched_pattern, DNS_MAX_CNAME_LEN);
+	chain->action = rule_result.action;
+	safe_strncpy(chain->group_name, rule_result.group_name, DNS_GROUP_NAME_LEN);
+	chain->server_num = rule_result.server_num;
+	memcpy(chain->servers, rule_result.servers, sizeof(chain->servers));
+
+	/* Phase 3+4: query servers and select final result (only for NAMESERVER/NONE) */
+	if (chain->action == DOMAIN_ACTION_NAMESERVER || chain->action == DOMAIN_ACTION_NONE) {
+		_resolve_query_servers(domain, chain);
+	}
+
+	return 0;
 }
 

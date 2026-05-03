@@ -116,6 +116,7 @@ impl API {
         api.register(Method::GET, "/api/config/geosite/file", true, APIRoute!(API::api_config_geosite_get_file));
         api.register(Method::PUT, "/api/config/geosite/file", true, APIRoute!(API::api_config_geosite_put_file));
         api.register(Method::POST, "/api/config/geosite/download", true, APIRoute!(API::api_config_geosite_download));
+        api.register(Method::GET, "/api/config/check-domain-rule", true, APIRoute!(API::api_config_check_domain_rule));
         api
     }
 
@@ -1715,6 +1716,49 @@ impl API {
 
             API::response_build(StatusCode::OK, body)
         }
+    }
+
+    /// Check domain rule resolution chain <br>
+    /// API: GET /api/config/check-domain-rule?domain=<domain> <br>
+    /// Runs `dns_conf_resolve_domain()` via FFI and returns the full resolution chain as JSON.
+    async fn api_config_check_domain_rule(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        _req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let params = API::get_params(&_req);
+        let domain = API::params_get_value::<String>(&params, "domain");
+        if domain.is_none() {
+            return API::response_error(StatusCode::BAD_REQUEST, "Missing 'domain' parameter.");
+        }
+
+        let domain = domain.unwrap();
+        if domain.trim().is_empty() {
+            return API::response_error(StatusCode::BAD_REQUEST, "Domain cannot be empty.");
+        }
+
+        let ret = API::call_blocking(this, move || {
+            smartdns::resolve_domain_chain(&domain)
+        })
+        .await;
+
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().as_str(),
+            );
+        }
+
+        let ret = ret.unwrap();
+        if let Err(e) = ret {
+            return API::response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.as_str(),
+            );
+        }
+
+        let chain = ret.unwrap();
+        API::response_build(StatusCode::OK, chain.to_string())
     }
 
     async fn call_blocking<F, R>(

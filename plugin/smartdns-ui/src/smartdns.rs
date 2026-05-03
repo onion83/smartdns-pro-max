@@ -1066,6 +1066,141 @@ pub fn get_cached_domains() -> Vec<CachedDomainInfo> {
     domains
 }
 
+/// Manually declared FFI types for dns_conf_resolve_domain() domain_rule.h API.
+/// These mirror the C struct layouts exactly (must match dns_conf.h constants).
+const DOMAIN_RULE_NAME_MAX_LEN: usize = 128;
+const DNS_MAX_CNAME_LEN: usize = 256;
+const DNS_MAX_IPLEN: usize = 64;
+const DNS_GROUP_NAME_LEN: usize = 32;
+const DNS_MAX_CHECK_SERVERS: usize = 64;
+const DNS_SERVER_INFO_STR_LEN: usize = 256;
+const DNS_MAX_QUERY_RESULT_IPS: usize = 16;
+const DNS_MAX_QUERY_RESULT_IPS_STR: usize = 46 * DNS_MAX_QUERY_RESULT_IPS; // INET6_ADDRSTRLEN(46) * 16
+
+#[repr(C)]
+struct DnsServerQueryResult {
+    server: [u8; DNS_SERVER_INFO_STR_LEN],
+    rcode: i32,
+    cname: [u8; DNS_MAX_CNAME_LEN],
+    ips: [u8; DNS_MAX_QUERY_RESULT_IPS_STR],
+    ip_count: i32,
+    ttl: u32,
+    ping_ms: u32,
+}
+
+#[repr(C)]
+struct DomainRuleResolveChain {
+    domain: [u8; DNS_MAX_CNAME_LEN],
+    rule_name: [u8; DOMAIN_RULE_NAME_MAX_LEN],
+    matched_pattern: [u8; DNS_MAX_CNAME_LEN],
+    action: u32,
+    address: [u8; DNS_MAX_IPLEN],
+    group_name: [u8; DNS_GROUP_NAME_LEN],
+    server_num: i32,
+    servers: [[u8; DNS_SERVER_INFO_STR_LEN]; DNS_MAX_CHECK_SERVERS],
+    query_result_num: i32,
+    query_results: [DnsServerQueryResult; DNS_MAX_CHECK_SERVERS],
+    final_rcode: i32,
+    final_ips: [u8; DNS_MAX_QUERY_RESULT_IPS_STR],
+    final_cname: [u8; DNS_MAX_CNAME_LEN],
+    final_from: [u8; DNS_SERVER_INFO_STR_LEN],
+    final_ttl: u32,
+    final_ping_ms: u32,
+}
+
+extern "C" {
+    fn dns_conf_resolve_domain(
+        domain: *const c_char,
+        chain: *mut DomainRuleResolveChain,
+    ) -> i32;
+}
+
+/// Resolve a domain through the full rule-matching + DNS query chain.
+/// Calls C `dns_conf_resolve_domain()` via FFI and converts the result to a Rust JSON value.
+pub fn resolve_domain_chain(domain: &str) -> Result<serde_json::Value, String> {
+    let domain_cstr = CString::new(domain).map_err(|e| e.to_string())?;
+    unsafe {
+        let mut chain: DomainRuleResolveChain = std::mem::zeroed();
+
+        let ret = dns_conf_resolve_domain(
+            domain_cstr.as_ptr(),
+            &mut chain,
+        );
+        if ret != 0 {
+            return Err(format!("dns_conf_resolve_domain failed for '{}'", domain));
+        }
+
+        let cstr = |buf: &[u8]| {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            String::from_utf8_lossy(&buf[..end]).into_owned()
+        };
+
+        let action_str = match chain.action {
+            0 => "NONE",     // DOMAIN_ACTION_NONE
+            1 => "ADDRESS",  // DOMAIN_ACTION_ADDRESS
+            2 => "NAMESERVER", // DOMAIN_ACTION_NAMESERVER
+            _ => "UNKNOWN",
+        };
+
+        let mut query_results = Vec::new();
+        for i in 0..chain.query_result_num {
+            let qr = &chain.query_results[i as usize];
+            let rcode_str = match qr.rcode {
+                -1 => "TIMEOUT",
+                0 => "NOERROR",
+                1 => "FORMERR",
+                2 => "SERVFAIL",
+                3 => "NXDOMAIN",
+                _ => "UNKNOWN",
+            };
+            query_results.push(serde_json::json!({
+                "server": cstr(&qr.server),
+                "rcode": rcode_str,
+                "rcode_num": qr.rcode,
+                "cname": cstr(&qr.cname),
+                "ips": cstr(&qr.ips),
+                "ip_count": qr.ip_count,
+                "ttl": qr.ttl,
+                "ping_ms": qr.ping_ms,
+            }));
+        }
+
+        let final_rcode_str = match chain.final_rcode {
+            -1 => "NO_ANSWER",
+            0 => "NOERROR",
+            1 => "FORMERR",
+            2 => "SERVFAIL",
+            3 => "NXDOMAIN",
+            _ => "UNKNOWN",
+        };
+
+        let mut servers = Vec::new();
+        for i in 0..chain.server_num {
+            let srv = &chain.servers[i as usize];
+            servers.push(cstr(srv));
+        }
+
+        Ok(serde_json::json!({
+            "domain": cstr(&chain.domain),
+            "rule_name": cstr(&chain.rule_name),
+            "matched_pattern": cstr(&chain.matched_pattern),
+            "action": action_str,
+            "address": cstr(&chain.address),
+            "group_name": cstr(&chain.group_name),
+            "server_num": chain.server_num,
+            "servers": servers,
+            "query_results": query_results,
+            "final_rcode": final_rcode_str,
+            "final_rcode_num": chain.final_rcode,
+            "final_ips": cstr(&chain.final_ips),
+            "final_cname": cstr(&chain.final_cname),
+            "final_from": cstr(&chain.final_from),
+            "final_ttl": chain.final_ttl,
+            "final_ping_ms": chain.final_ping_ms,
+        }))
+    }
+}
+
 pub struct Stats {}
 
 impl Stats {

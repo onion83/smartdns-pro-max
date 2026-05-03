@@ -99,6 +99,7 @@ enum domain_rule {
 	DOMAIN_RULE_RESPONSE_MODE, /* Response mode */
 	DOMAIN_RULE_CNAME,         /* CNAME rule */
 	DOMAIN_RULE_TTL,           /* TTL control */
+	DOMAIN_RULE_NAME,          /* Rule name for debugging */
 
 	DOMAIN_RULE_MAX,
 };
@@ -284,6 +285,74 @@ struct dns_nameserver_rule {
 struct dns_group_rule {
 	struct dns_rule head;
 	const char *group_name;
+};
+
+struct dns_name_rule {
+	struct dns_rule head;
+	const char *name;       /* rule name (strdup'd) */
+	char is_auto;           /* 1 = auto-generated name (drn-XXXXX) */
+};
+
+#define DOMAIN_RULE_NAME_MAX_LEN 128
+#define DNS_MAX_CHECK_SERVERS 64
+#define DNS_SERVER_INFO_STR_LEN 256
+
+enum domain_rule_action {
+	DOMAIN_ACTION_NONE = 0,
+	DOMAIN_ACTION_ADDRESS,
+	DOMAIN_ACTION_NAMESERVER,
+};
+
+struct domain_rule_check_result {
+	char domain[DNS_MAX_CNAME_LEN];           /* queried domain */
+	char rule_name[DOMAIN_RULE_NAME_MAX_LEN]; /* matched rule name, "PASS" if no match */
+	char matched_pattern[DNS_MAX_CNAME_LEN];  /* matched domain pattern */
+	enum domain_rule_action action;           /* ADDRESS / NAMESERVER / NONE */
+	char group_name[DNS_GROUP_NAME_LEN];      /* DNS group name */
+	int server_num;                           /* number of DNS servers in group */
+	char servers[DNS_MAX_CHECK_SERVERS][DNS_SERVER_INFO_STR_LEN]; /* DNS server list */
+};
+
+#define DNS_MAX_QUERY_RESULT_IPS 16
+#define DNS_MAX_QUERY_RESULT_IPS_STR (INET6_ADDRSTRLEN * DNS_MAX_QUERY_RESULT_IPS)
+
+/* Per-server DNS query result */
+struct dns_server_query_result {
+	char server[DNS_SERVER_INFO_STR_LEN];                        /* "udp://223.5.5.5" */
+	int rcode;                                                   /* DNS rcode (0=NOERROR, 3=NXDOMAIN), -1=timeout */
+	char cname[DNS_MAX_CNAME_LEN];                               /* CNAME target */
+	char ips[DNS_MAX_QUERY_RESULT_IPS_STR];                     /* comma-separated IP addresses */
+	int ip_count;                                                /* number of IPs returned */
+	unsigned int ttl;                                            /* TTL of the answer */
+	unsigned int ping_ms;                                        /* round-trip time in ms */
+};
+
+/* Full domain resolution chain: rule matching + actual DNS query results.
+ * Populated by dns_conf_resolve_domain(), can be consumed by CLI, plugins, or API. */
+struct domain_rule_resolve_chain {
+	/* Phase 1: rule matching */
+	char domain[DNS_MAX_CNAME_LEN];                /* queried domain */
+	char rule_name[DOMAIN_RULE_NAME_MAX_LEN];      /* matched rule name, "PASS" if no match */
+	char matched_pattern[DNS_MAX_CNAME_LEN];       /* matched domain pattern */
+	enum domain_rule_action action;                /* ADDRESS / NAMESERVER / NONE */
+
+	/* Phase 2: action details */
+	char address[DNS_MAX_IPLEN];                   /* ADDRESS action: static IP */
+	char group_name[DNS_GROUP_NAME_LEN];           /* NAMESERVER/NONE: server group name */
+	int server_num;                                /* number of servers in group */
+	char servers[DNS_MAX_CHECK_SERVERS][DNS_SERVER_INFO_STR_LEN]; /* server list */
+
+	/* Phase 3: per-server query results */
+	int query_result_num;                          /* number of servers actually queried */
+	struct dns_server_query_result query_results[DNS_MAX_CHECK_SERVERS];
+
+	/* Phase 4: final aggregated result */
+	int final_rcode;                               /* rcode of the chosen answer, -1 = no answer */
+	char final_ips[DNS_MAX_QUERY_RESULT_IPS_STR]; /* comma-separated IPs from best answer */
+	char final_cname[DNS_MAX_CNAME_LEN];          /* CNAME if no IPs */
+	char final_from[DNS_SERVER_INFO_STR_LEN];     /* which server provided the answer */
+	unsigned int final_ttl;                        /* TTL of the final answer */
+	unsigned int final_ping_ms;                    /* ping time to the answering server */
 };
 
 struct dns_server_groups {

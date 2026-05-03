@@ -33,6 +33,7 @@
 #include "dns64.h"
 #include "dns_conf_group.h"
 #include "domain_rule.h"
+#include "domain_rule.h"
 #include "domain_set.h"
 #include "geosite.h"
 #include "group.h"
@@ -408,6 +409,8 @@ static void _dns_conf_default_value_init(void)
 static int _dns_conf_load_pre(void)
 {
 	_dns_conf_default_value_init();
+
+	_domain_rule_auto_name_reset();
 
 	if (_dns_server_load_conf_init() != 0) {
 		goto errout;

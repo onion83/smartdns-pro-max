@@ -116,7 +116,7 @@ impl API {
         api.register(Method::GET, "/api/config/geosite/file", true, APIRoute!(API::api_config_geosite_get_file));
         api.register(Method::PUT, "/api/config/geosite/file", true, APIRoute!(API::api_config_geosite_put_file));
         api.register(Method::POST, "/api/config/geosite/download", true, APIRoute!(API::api_config_geosite_download));
-        api.register(Method::GET, "/api/config/check-domain-rule", true, APIRoute!(API::api_config_check_domain_rule));
+        api.register(Method::GET, "/api/config/check-domain-rule", false, APIRoute!(API::api_config_check_domain_rule));
         api
     }
 

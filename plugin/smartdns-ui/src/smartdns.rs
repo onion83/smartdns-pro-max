@@ -1089,6 +1089,15 @@ struct DnsServerQueryResult {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IpPingResult {
+    pub ip: [u8; DNS_MAX_CNAME_LEN],
+    pub addr_type: i32,
+    pub ping_time: i32,
+    pub is_timeout: i32,
+}
+
+#[repr(C)]
 struct DomainRuleResolveChain {
     domain: [u8; DNS_MAX_CNAME_LEN],
     rule_name: [u8; DOMAIN_RULE_NAME_MAX_LEN],
@@ -1106,6 +1115,17 @@ struct DomainRuleResolveChain {
     final_from: [u8; DNS_SERVER_INFO_STR_LEN],
     final_ttl: u32,
     final_ping_ms: u32,
+    speed_check_enabled: i32,
+    response_mode: i32,
+    cache_hit: i32,
+    cache_ttl: i32,
+    cache_speed: u32,
+    cache_rcode: i32,
+    cache_from_group: [u8; DNS_GROUP_NAME_LEN],
+    cache_ips: [u8; DNS_MAX_QUERY_RESULT_IPS_STR],
+    cache_cname: [u8; DNS_MAX_CNAME_LEN],
+    ping_result_num: i32,
+    ping_results: [IpPingResult; 8],
 }
 
 extern "C" {
@@ -1197,6 +1217,29 @@ pub fn resolve_domain_chain(domain: &str) -> Result<serde_json::Value, String> {
             "final_from": cstr(&chain.final_from),
             "final_ttl": chain.final_ttl,
             "final_ping_ms": chain.final_ping_ms,
+            "speed_check_enabled": chain.speed_check_enabled,
+            "response_mode": chain.response_mode,
+            "cache_result": {
+                "hit": chain.cache_hit,
+                "ttl": chain.cache_ttl,
+                "speed": chain.cache_speed,
+                "rcode": chain.cache_rcode,
+                "from_group": cstr(&chain.cache_from_group),
+                "ips": cstr(&chain.cache_ips),
+                "cname": cstr(&chain.cache_cname),
+            },
+            "ping_results": (0..chain.ping_result_num as usize)
+                .map(|i| {
+                    let pr = &chain.ping_results[i];
+                    serde_json::json!({
+                        "ip": cstr(&pr.ip),
+                        "addr_type": pr.addr_type,
+                        "ping_time": pr.ping_time,
+                        "ping_ms": if pr.ping_time > 0 { pr.ping_time / 10 } else { -1 },
+                        "is_timeout": pr.is_timeout,
+                    })
+                })
+                .collect::<Vec<_>>(),
         }))
     }
 }

@@ -44,6 +44,7 @@ pub enum LogLevel {
     WARN = 3,
     ERROR = 4,
     FATAL = 5,
+    OFF = 6,
 }
 
 impl From<LogLevel> for u32 {
@@ -61,6 +62,7 @@ impl ToString for LogLevel {
             LogLevel::WARN => "warn".to_string(),
             LogLevel::ERROR => "error".to_string(),
             LogLevel::FATAL => "fatal".to_string(),
+            LogLevel::OFF => "off".to_string(),
         }
     }
 }
@@ -76,6 +78,7 @@ impl TryFrom<u32> for LogLevel {
             3 => Ok(LogLevel::WARN),
             4 => Ok(LogLevel::ERROR),
             5 => Ok(LogLevel::FATAL),
+            6 => Ok(LogLevel::OFF),
             _ => Err(()),
         }
     }
@@ -92,6 +95,7 @@ impl TryFrom<&str> for LogLevel {
             "warn" => Ok(LogLevel::WARN),
             "error" => Ok(LogLevel::ERROR),
             "fatal" => Ok(LogLevel::FATAL),
+            "off" => Ok(LogLevel::OFF),
             _ => Err(()),
         }
     }

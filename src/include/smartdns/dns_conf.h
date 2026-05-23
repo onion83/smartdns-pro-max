@@ -311,6 +311,7 @@ struct domain_rule_check_result {
 	char group_name[DNS_GROUP_NAME_LEN];      /* DNS group name */
 	int server_num;                           /* number of DNS servers in group */
 	char servers[DNS_MAX_CHECK_SERVERS][DNS_SERVER_INFO_STR_LEN]; /* DNS server list */
+	enum response_mode_type response_mode;     /* response mode for this domain */
 };
 
 #define DNS_MAX_QUERY_RESULT_IPS 16
@@ -353,6 +354,7 @@ struct domain_rule_resolve_chain {
 	char final_from[DNS_SERVER_INFO_STR_LEN];     /* which server provided the answer */
 	unsigned int final_ttl;                        /* TTL of the final answer */
 	unsigned int final_ping_ms;                    /* ping time to the answering server */
+	enum response_mode_type response_mode;          /* response mode for this domain */
 };
 
 struct dns_server_groups {

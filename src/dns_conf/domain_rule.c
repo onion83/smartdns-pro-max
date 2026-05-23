@@ -1447,6 +1447,7 @@ int dns_conf_check_domain_rule(const char *domain, struct domain_rule_check_resu
 	safe_strncpy(result->rule_name, "PASS", DOMAIN_RULE_NAME_MAX_LEN);
 	safe_strncpy(result->group_name, "default", DNS_GROUP_NAME_LEN);
 	result->action = DOMAIN_ACTION_NONE;
+	result->response_mode = dns_conf.default_response_mode;
 
 	/* Use default rule group for check-domain-rule command */
 	conf_group = dns_server_get_default_rule_group();
@@ -1473,6 +1474,12 @@ int dns_conf_check_domain_rule(const char *domain, struct domain_rule_check_resu
 				if (name_rule->name != NULL) {
 					safe_strncpy(result->rule_name, name_rule->name, DOMAIN_RULE_NAME_MAX_LEN);
 				}
+			}
+
+			/* Get response mode from rule */
+			if (DOMAIN_RULE_RESPONSE_MODE < domain_rule->capacity && domain_rule->rules[DOMAIN_RULE_RESPONSE_MODE] != NULL) {
+				struct dns_response_mode_rule *rm = (struct dns_response_mode_rule *)domain_rule->rules[DOMAIN_RULE_RESPONSE_MODE];
+				result->response_mode = rm->mode;
 			}
 
 			/* Determine action: ADDRESS takes priority */
@@ -1536,29 +1543,117 @@ const char *dns_conf_check_domain_group(const char *domain)
 
 #define RESOLVE_DNS_TIMEOUT_MS 3000
 
-/* Parse "udp://1.2.3.4:53" or "udp://1.2.3.4" into (ip, port). */
+/* Parse "udp://1.2.3.4:53", "udp://[::1]:53", or "udp://[::1]" into (ip, port). */
 static void _parse_server_addr(const char *server_str, char *ip, int ip_len, int *port)
 {
 	const char *p = strstr(server_str, "://");
 	p = p ? p + 3 : server_str;
 
+	*port = 53; /* default port */
+
+	/* Check for IPv6 address in brackets: [::1]:53 or [::1] */
+	if (*p == '[') {
+		const char *end_bracket = strchr(p, ']');
+		if (end_bracket != NULL) {
+			/* Extract IPv6 address */
+			int len = (int)(end_bracket - p - 1);
+			if (len > 0 && len < ip_len) {
+				safe_strncpy(ip, p + 1, len + 1);
+				ip[len] = '\0';
+			}
+			/* Check for port after ] */
+			if (end_bracket[1] == ':') {
+				*port = atoi(end_bracket + 2);
+			}
+			return;
+		}
+	}
+
+	/* Check for IPv6 address without brackets (no port or with port) */
+	/* IPv6 addresses contain multiple colons */
 	char buf[DNS_MAX_IPLEN];
 	safe_strncpy(buf, p, sizeof(buf));
-	char *colon = strrchr(buf, ':');
-	if (colon) {
-		*colon = '\0';
-		*port = atoi(colon + 1);
-	} else {
-		*port = 53;
+
+	/* Count colons to detect IPv6 */
+	int colon_count = 0;
+	const char *q = buf;
+	while (*q) {
+		if (*q == ':')
+			colon_count++;
+		q++;
 	}
-	safe_strncpy(ip, buf, ip_len);
+
+	if (colon_count >= 2) {
+		/* This is an IPv6 address */
+		/* Check if there's a port after the last colon */
+		/* For IPv6, port must be specified after a single colon at the end */
+		/* e.g., ::1:53 or ::1:0:53 */
+		/* We'll assume no port for bare IPv6, or port is after the last colon if it looks like a port */
+		safe_strncpy(ip, buf, ip_len);
+		/* Try to detect port: if the part after the last colon is a pure number, treat as port */
+		char *last_colon = strrchr(buf, ':');
+		if (last_colon != NULL) {
+			char *after_colon = last_colon + 1;
+			if (after_colon[0] != '\0') {
+				/* Check if after_colon is a pure number */
+				int is_num = 1;
+				for (char *c = after_colon; *c; c++) {
+					if (*c < '0' || *c > '9') {
+						is_num = 0;
+						break;
+					}
+				}
+				if (is_num && strlen(after_colon) <= 5) {
+					/* It's a port number */
+					*last_colon = '\0';
+					*port = atoi(after_colon);
+					safe_strncpy(ip, buf, ip_len);
+				}
+			}
+		}
+	} else {
+		/* IPv4 address */
+		char *colon = strrchr(buf, ':');
+		if (colon) {
+			*colon = '\0';
+			*port = atoi(colon + 1);
+		}
+		safe_strncpy(ip, buf, ip_len);
+	}
 }
 
-/* Send a UDP DNS query, return response length or -1. */
+/* Send a UDP DNS query, return response length or -1. Supports IPv4 and IPv6. */
 static int _resolve_udp_query(const char *server_ip, int server_port, const char *domain, int qtype,
 							  unsigned char *response, int response_len, unsigned int *ping_ms)
 {
-	int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+	/* Detect if server_ip is IPv6 or IPv4 */
+	struct sockaddr_storage addr;
+	socklen_t addr_len = 0;
+	int af = AF_INET;
+	int sockfd = -1;
+
+	memset(&addr, 0, sizeof(addr));
+
+	/* Try to parse as IPv6 first */
+	struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&addr;
+	if (inet_pton(AF_INET6, server_ip, &addr6->sin6_addr) == 1) {
+		af = AF_INET6;
+		addr6->sin6_family = AF_INET6;
+		addr6->sin6_port = htons(server_port);
+		addr_len = sizeof(struct sockaddr_in6);
+	} else {
+		/* Parse as IPv4 */
+		struct sockaddr_in *addr4 = (struct sockaddr_in *)&addr;
+		if (inet_pton(AF_INET, server_ip, &addr4->sin_addr) != 1) {
+			return -1;
+		}
+		af = AF_INET;
+		addr4->sin_family = AF_INET;
+		addr4->sin_port = htons(server_port);
+		addr_len = sizeof(struct sockaddr_in);
+	}
+
+	sockfd = socket(af, SOCK_DGRAM, 0);
 	if (sockfd < 0) {
 		return -1;
 	}
@@ -1582,11 +1677,8 @@ static int _resolve_udp_query(const char *server_ip, int server_port, const char
 		return -1;
 	}
 
-	struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(server_port)};
-	inet_pton(AF_INET, server_ip, &addr.sin_addr);
-
 	unsigned long start = get_tick_count();
-	if (sendto(sockfd, wire, wire_len, 0, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+	if (sendto(sockfd, wire, wire_len, 0, (struct sockaddr *)&addr, addr_len) < 0) {
 		close(sockfd);
 		return -1;
 	}
@@ -1703,10 +1795,25 @@ static void _resolve_query_servers(const char *domain, struct domain_rule_resolv
 		chain->query_result_num++;
 	}
 
-	/* Select final result: prefer first server with IPs, then CNAME, then first rcode */
-	for (int i = 0; i < chain->query_result_num; i++) {
-		struct dns_server_query_result *qr = &chain->query_results[i];
-		if (qr->rcode == 0 && qr->ip_count > 0) {
+	/* Select final result based on response_mode */
+	if (chain->response_mode == DNS_RESPONSE_MODE_FASTEST_RESPONSE ||
+		chain->response_mode == DNS_RESPONSE_MODE_FASTEST_IP) {
+		/* FASTEST_RESPONSE: select server with smallest ping_ms */
+		/* FASTEST_IP: simplified - same as FASTEST_RESPONSE for now */
+		int best_idx = -1;
+		unsigned int best_ping = (unsigned int)-1;
+
+		/* Find server with IPs and smallest ping_ms */
+		for (int i = 0; i < chain->query_result_num; i++) {
+			struct dns_server_query_result *qr = &chain->query_results[i];
+			if (qr->rcode == 0 && qr->ip_count > 0 && qr->ping_ms < best_ping) {
+				best_ping = qr->ping_ms;
+				best_idx = i;
+			}
+		}
+
+		if (best_idx >= 0) {
+			struct dns_server_query_result *qr = &chain->query_results[best_idx];
 			chain->final_rcode = 0;
 			safe_strncpy(chain->final_ips, qr->ips, sizeof(chain->final_ips));
 			safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
@@ -1714,23 +1821,66 @@ static void _resolve_query_servers(const char *domain, struct domain_rule_resolv
 			chain->final_ping_ms = qr->ping_ms;
 			return;
 		}
-	}
-	for (int i = 0; i < chain->query_result_num; i++) {
-		struct dns_server_query_result *qr = &chain->query_results[i];
-		if (qr->rcode == 0 && qr->cname[0] != '\0') {
+
+		/* No IPs found, try CNAME */
+		best_idx = -1;
+		best_ping = (unsigned int)-1;
+		for (int i = 0; i < chain->query_result_num; i++) {
+			struct dns_server_query_result *qr = &chain->query_results[i];
+			if (qr->rcode == 0 && qr->cname[0] != '\0' && qr->ping_ms < best_ping) {
+				best_ping = qr->ping_ms;
+				best_idx = i;
+			}
+		}
+
+		if (best_idx >= 0) {
+			struct dns_server_query_result *qr = &chain->query_results[best_idx];
 			chain->final_rcode = 0;
 			safe_strncpy(chain->final_cname, qr->cname, sizeof(chain->final_cname));
 			safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
 			chain->final_ping_ms = qr->ping_ms;
 			return;
 		}
-	}
-	for (int i = 0; i < chain->query_result_num; i++) {
-		struct dns_server_query_result *qr = &chain->query_results[i];
-		if (qr->rcode != 0 && qr->rcode != -1) {
-			chain->final_rcode = qr->rcode;
-			safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
-			return;
+
+		/* No success, return first error rcode */
+		for (int i = 0; i < chain->query_result_num; i++) {
+			struct dns_server_query_result *qr = &chain->query_results[i];
+			if (qr->rcode != 0 && qr->rcode != -1) {
+				chain->final_rcode = qr->rcode;
+				safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
+				return;
+			}
+		}
+	} else {
+		/* FIRST_PING_IP: prefer first server with IPs, then CNAME, then first rcode */
+		for (int i = 0; i < chain->query_result_num; i++) {
+			struct dns_server_query_result *qr = &chain->query_results[i];
+			if (qr->rcode == 0 && qr->ip_count > 0) {
+				chain->final_rcode = 0;
+				safe_strncpy(chain->final_ips, qr->ips, sizeof(chain->final_ips));
+				safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
+				chain->final_ttl = qr->ttl;
+				chain->final_ping_ms = qr->ping_ms;
+				return;
+			}
+		}
+		for (int i = 0; i < chain->query_result_num; i++) {
+			struct dns_server_query_result *qr = &chain->query_results[i];
+			if (qr->rcode == 0 && qr->cname[0] != '\0') {
+				chain->final_rcode = 0;
+				safe_strncpy(chain->final_cname, qr->cname, sizeof(chain->final_cname));
+				safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
+				chain->final_ping_ms = qr->ping_ms;
+				return;
+			}
+		}
+		for (int i = 0; i < chain->query_result_num; i++) {
+			struct dns_server_query_result *qr = &chain->query_results[i];
+			if (qr->rcode != 0 && qr->rcode != -1) {
+				chain->final_rcode = qr->rcode;
+				safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
+				return;
+			}
 		}
 	}
 }
@@ -1760,6 +1910,7 @@ int dns_conf_resolve_domain(const char *domain, struct domain_rule_resolve_chain
 	safe_strncpy(chain->group_name, rule_result.group_name, DNS_GROUP_NAME_LEN);
 	chain->server_num = rule_result.server_num;
 	memcpy(chain->servers, rule_result.servers, sizeof(chain->servers));
+	chain->response_mode = rule_result.response_mode;
 
 	/* Phase 3+4: query servers and select final result (only for NAMESERVER/NONE) */
 	if (chain->action == DOMAIN_ACTION_NAMESERVER || chain->action == DOMAIN_ACTION_NONE) {

@@ -1159,12 +1159,19 @@ pub fn resolve_domain_chain(domain: &str) -> Result<serde_json::Value, String> {
             String::from_utf8_lossy(&buf[..end]).into_owned()
         };
 
-        let action_str = match chain.action {
-            0 => "NONE",     // DOMAIN_ACTION_NONE
-            1 => "ADDRESS",  // DOMAIN_ACTION_ADDRESS
-            2 => "NAMESERVER", // DOMAIN_ACTION_NAMESERVER
-            _ => "UNKNOWN",
-        };
+	let action_str = match chain.action {
+		0 => "NONE",     // DOMAIN_ACTION_NONE
+		1 => "ADDRESS",  // DOMAIN_ACTION_ADDRESS
+		2 => "NAMESERVER", // DOMAIN_ACTION_NAMESERVER
+		_ => "UNKNOWN",
+	};
+
+	let response_mode_str = match chain.response_mode {
+		0 => "FIRST_PING_IP",
+		1 => "FASTEST_IP",
+		2 => "FASTEST_RESPONSE",
+		_ => "UNKNOWN",
+	};
 
         let mut query_results = Vec::new();
         for i in 0..chain.query_result_num {
@@ -1222,7 +1229,7 @@ pub fn resolve_domain_chain(domain: &str) -> Result<serde_json::Value, String> {
             "final_ttl": chain.final_ttl,
             "final_ping_ms": chain.final_ping_ms,
             "speed_check_enabled": chain.speed_check_enabled,
-            "response_mode": chain.response_mode,
+            "response_mode": response_mode_str,
             "cache_result": {
                 "hit": chain.cache_hit,
                 "ttl": chain.cache_ttl,

@@ -23,6 +23,10 @@ RUNSTATEDIR := /run
 SYSTEMDSYSTEMUNITDIR := $(shell ${PKG_CONFIG} --variable=systemdsystemunitdir systemd)
 SMARTDNS_SYSTEMD = systemd/smartdns.service
 
+export PKG_CONFIG_PATH=/opt/openssl/lib64/pkgconfig
+export CFLAGS := $(shell pkg-config --cflags openssl)
+export LDFLAGS := $(shell pkg-config --libs openssl)
+
 ifneq ($(strip $(DESTDIR)),)
 $(shell mkdir -p $(DESTDIR) -m 0755)
 override DESTDIR := $(realpath $(DESTDIR))

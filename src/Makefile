@@ -80,7 +80,7 @@ override CFLAGS += -DHAVE_UNWIND_BACKTRACE
 endif
 
 override CFLAGS +=-Iinclude
-override CFLAGS += -DBASE_FILE_NAME='"$(notdir $<)"'
+override CFLAGS += -DBASE_FILE_NAME=\"$(notdir $<)\"
 override CFLAGS += $(EXTRA_CFLAGS)
 
 ifdef VER
@@ -130,7 +130,7 @@ else ifdef STATIC_DEPS
   override LDFLAGS += -Wl,-Bstatic -lssl -lcrypto -lz -Wl,-Bdynamic -lpthread -ldl -lm -rdynamic
  endif
 else
- override LDFLAGS += -lssl -lcrypto -lpthread -ldl -lm -rdynamic
+ override LDFLAGS += -lssl -lcrypto -lpthread -ldl -lm -lz -rdynamic
 endif
 
 USE_ATOMIC := $(shell printf '$(HASH)include <stdint.h>\nvoid main() { uint64_t value=0;__atomic_add_fetch(&value, 1, __ATOMIC_SEQ_CST);__atomic_load_n(&value,__ATOMIC_SEQ_CST);}' | $(CC) -x c - -o /dev/null >/dev/null 2>&1 && echo -n 1 || echo -n 0)

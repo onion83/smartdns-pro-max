@@ -158,6 +158,9 @@ static int _dns_client_process_tcp_buff(struct dns_server_info *server_info)
 	unsigned char *inpacket_data = NULL;
 	int ret = -1;
 
+	/* 增加引用计数，防止在处理过程中被释放 */
+	dns_client_server_info_get(server_info);
+
 	while (1) {
 		if (server_info->type == DNS_SERVER_HTTPS) {
 			http_head = http_head_init(4096, HTTP_VERSION_1_1);
@@ -247,6 +250,9 @@ static int _dns_client_process_tcp_buff(struct dns_server_info *server_info)
 
 	ret = 0;
 out:
+	/* 释放引用计数 */
+	dns_client_server_info_release(server_info);
+
 	if (http_head) {
 		http_head_destroy(http_head);
 	}

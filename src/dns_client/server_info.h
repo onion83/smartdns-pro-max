@@ -31,6 +31,10 @@ void _dns_server_dec_prohibit_server_num(struct dns_server_info *server_info);
 
 void _dns_client_server_close(struct dns_server_info *server_info);
 
+void dns_client_server_info_get(struct dns_server_info *server_info);
+
+void dns_client_server_info_release(struct dns_server_info *server_info);
+
 const char *_dns_server_get_type_string(dns_server_type_t type);
 
 void _dns_client_server_remove_all(void);

@@ -24,6 +24,12 @@
 
 #include "smartdns/http_parse.h"
 
+static int _dns_client_http3_has_content_length(struct http_head *http_head)
+{
+	const char *content_len = http_head_get_fields_value(http_head, "content-length");
+	return content_len != NULL && content_len[0] != '\0';
+}
+
 int _dns_client_send_http3(struct dns_query_struct *query, struct dns_server_info *server_info, void *packet,
 						   unsigned short len)
 {
@@ -93,12 +99,13 @@ int _dns_client_process_recv_http3(struct dns_server_info *server_info, struct d
 	ret = http_head_parse(http_head, conn_stream->recv_buff.data, conn_stream->recv_buff.len);
 	if (ret < 0) {
 		if (ret == -1) {
+			errno = EAGAIN;
+			ret = 1;
 			goto out;
 		} else if (ret == -3) {
 			/* repsone is too large */
 			tlog(TLOG_DEBUG, "http3 response is too large.");
 			conn_stream->recv_buff.len = 0;
-			_dns_client_conn_stream_put(conn_stream);
 			goto errout;
 		}
 
@@ -125,12 +132,19 @@ int _dns_client_process_recv_http3(struct dns_server_info *server_info, struct d
 		goto errout;
 	}
 
+	if (_dns_client_http3_has_content_length(http_head) == 0 && conn_stream->recv_done == 0) {
+		errno = EAGAIN;
+		ret = 1;
+		goto out;
+	}
+
 	if (_dns_client_recv(server_info, pkg_data, pkg_len, &server_info->addr, server_info->ai_addrlen) != 0) {
 		goto errout;
 	}
+	ret = 0;
 out:
 	http_head_destroy(http_head);
-	return 0;
+	return ret;
 errout:
 
 	if (http_head) {

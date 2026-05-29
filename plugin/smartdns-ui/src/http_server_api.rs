@@ -1232,6 +1232,7 @@ impl API {
             let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)
                 .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+            #[cfg(target_os = "linux")]
             tokio::spawn(async move {
                 if let Err(e) = http_server_stream::serve_term(websocket).await {
                     dns_log!(LogLevel::DEBUG, "Error in websocket connection: {e}");

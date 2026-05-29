@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Debug)]
 struct IgnoreMacros(HashSet<String>);
@@ -30,13 +31,9 @@ fn get_git_commit_version() {
 }
 
 fn link_rename_lib() {
-    /*
-    rename the output file to smartdns_ui.so
-    */
     let release_plugin = env::var("RELEASE_PLUGIN").is_ok();
 
     if release_plugin == false {
-        // In debug mode, we don't rename the output file
         return;
     }
 
@@ -47,6 +44,66 @@ fn link_rename_lib() {
     let so_path = format!("{}/{}.so", target_dir, crate_name);
     println!("cargo:rustc-link-arg=-o");
     println!("cargo:rustc-link-arg={}", so_path);
+}
+
+/// 用 bindgen 库生成 bindings（glibc 系统）
+fn gen_bindings_with_lib(
+    smartdns_inc_dir: &str,
+    smartdns_src_dir: &str,
+    out_path: &PathBuf,
+    sysroot: &Option<String>,
+) {
+    let ignored_macros = IgnoreMacros(vec!["IPPORT_RESERVED".into()].into_iter().collect());
+
+    let mut bindings_builder =
+        bindgen::Builder::default().header(format!("{}/smartdns/smartdns.h", smartdns_inc_dir));
+    if let Some(sysroot) = sysroot {
+        bindings_builder = bindings_builder.clang_arg(format!("--sysroot={}", sysroot));
+    }
+    let bindings = bindings_builder
+        .clang_arg(format!("-I{}", smartdns_src_dir))
+        .parse_callbacks(Box::new(ignored_macros))
+        .generate()
+        .expect("Unable to generate bindings");
+
+    bindings
+        .write_to_file(out_path.join("smartdns_bindings.rs"))
+        .expect("Couldn't write bindings!");
+}
+
+/// 用 bindgen-cli 生成 bindings（Alpine/musl 系统，libloading 无法 dlopen libclang.so）
+fn gen_bindings_with_cli(
+    smartdns_inc_dir: &str,
+    smartdns_src_dir: &str,
+    out_path: &PathBuf,
+) {
+    let ignored_macros = IgnoreMacros(vec!["IPPORT_RESERVED".into()].into_iter().collect());
+
+    // 生成主 bindings
+    let output = Command::new("bindgen")
+        .args(&[
+            &format!("{}/smartdns/smartdns.h", smartdns_inc_dir),
+            "--use-core",
+            "--with-derive-default",
+            "--with-derive-partialeq",
+            "--with-derive-eq",
+            "--with-derive-hash",
+            "--impl-debug",
+            "--blocklist-item", "IPPORT_RESERVED",
+            "--",
+            "-I", &smartdns_inc_dir,
+            "-I", &smartdns_src_dir,
+        ])
+        .args(&["-o", &out_path.join("smartdns_bindings.rs").to_string_lossy()])
+        .output()
+        .expect("Failed to execute bindgen-cli");
+
+    if !output.status.success() {
+        panic!(
+            "bindgen-cli failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn link_smartdns_lib() {
@@ -69,28 +126,27 @@ fn link_smartdns_lib() {
         }
     }
 
-    let ignored_macros = IgnoreMacros(vec!["IPPORT_RESERVED".into()].into_iter().collect());
-
-    let mut bindings_builder =
-        bindgen::Builder::default().header(format!("{}/smartdns/smartdns.h", smartdns_inc_dir));
-    if let Some(sysroot) = sysroot {
-        bindings_builder = bindings_builder.clang_arg(format!("--sysroot={}", sysroot));
-    }
-    let bindings = bindings_builder
-        .clang_arg(format!("-I{}/include", smartdns_src_dir))
-        .parse_callbacks(Box::new(ignored_macros))
-        .generate()
-        .expect("Unable to generate bindings");
-
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_path.join("smartdns_bindings.rs"))
-        .expect("Couldn't write bindings!");
 
-    // Generate additional bindings for geosite functions not included in smartdns.h
+    // 检测是否是 musl 目标（Alpine），用 bindgen-cli 替代 bindgen 库
+    let target = env::var("TARGET").unwrap_or_default();
+    let is_musl = target.contains("musl");
+
+    if is_musl {
+        gen_bindings_with_cli(&smartdns_inc_dir, &smartdns_src_dir, &out_path);
+    } else {
+        gen_bindings_with_lib(
+            &smartdns_inc_dir,
+            &smartdns_src_dir,
+            &out_path,
+            &sysroot,
+        );
+    }
+
+    // Generate additional bindings for geosite functions
     let geosite_bindings = bindgen::Builder::default()
         .header(format!("{}/dns_conf/geosite.h", smartdns_src_dir))
-        .clang_arg(format!("-I{}/include", smartdns_src_dir))
+        .clang_arg(format!("-I{}", smartdns_src_dir))
         .allowlist_function("geosite_resolve_dat_path")
         .allowlist_function("geosite_get_updater_config")
         .allowlist_function("geosite_download_url_files_sync")
@@ -103,10 +159,7 @@ fn link_smartdns_lib() {
     geosite_bindings
         .write_to_file(out_path.join("geosite_bindings.rs"))
         .expect("Couldn't write geosite bindings!");
-    /*
-    to run tests, please run the following command:
-    make test-prepare
-    */
+
     if std::path::Path::new(&smartdns_lib_file).exists() && !cfg!(feature = "build-release") {
         println!("cargo:rerun-if-changed={}", smartdns_lib_file);
         println!("cargo:rustc-link-lib=static=smartdns-test");

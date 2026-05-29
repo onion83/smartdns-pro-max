@@ -35,4 +35,4 @@ sub-config-*.conf
 # Build artifacts
 third_party/openssl/
 smartdns
-smartdns_ui.so
+smartdns_ui.so.workbuddy/

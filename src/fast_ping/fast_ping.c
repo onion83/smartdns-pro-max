@@ -431,8 +431,6 @@ static void _fast_ping_period_run(void)
 		tv_sub(&interval, &ping_host->last);
 		millisecond = interval.tv_sec * 1000 + interval.tv_usec / 1000;
 		if (millisecond >= ping_host->timeout && ping_host->send == 1) {
-			tlog(TLOG_DEBUG, "ping timeout, host: %s, id: %d, millisecond: %ld, timeout: %d", 
-			     ping_host->host, ping_host->sid, millisecond, ping_host->timeout);
 			_fast_ping_send_notify_event(ping_host, PING_RESULT_TIMEOUT, ping_host->seq, ping_host->ttl, &interval);
 			ping_host->send = 0;
 		}
@@ -526,11 +524,7 @@ static void *_fast_ping_work(void *arg)
 			}
 
 			struct ping_host_struct *ping_host = (struct ping_host_struct *)event->data.ptr;
-			/* 增加引用计数，防止在处理过程中被释放 */
-			_fast_ping_host_get(ping_host);
 			_fast_ping_process(ping_host, event, &tvnow);
-			/* 处理完毕，减少引用计数 */
-			_fast_ping_host_put(ping_host);
 		}
 	}
 

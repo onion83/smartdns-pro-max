@@ -78,36 +78,17 @@ void dns_server_check_ipv6_ready(void)
 	}
 
 	if (is_tcp_check_set) {
-		/* 修复：用同步 socket + connect 替代 fast_ping_start，避免 use-after-free */
-		int fd = socket(AF_INET6, SOCK_STREAM, 0);
-		if (fd >= 0) {
-			struct sockaddr_in6 addr;
-			memset(&addr, 0, sizeof(addr));
-			addr.sin6_family = AF_INET6;
-			addr.sin6_port = htons(443);
-			inet_pton(AF_INET6, "2001::", &addr.sin6_addr);
-			
-			int ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-			close(fd);
-			
-			if (ret == 0) {
-				is_ipv6_ready = 1;
-				return;
-			}
-			
-			if (errno == EADDRNOTAVAIL) {
-				is_ipv6_ready = 0;
-				return;
-			}
-			
-			/* 连接失败但地址可用 */
+		struct ping_host_struct *check_ping = fast_ping_start(PING_TYPE_TCP, "2001::", 1, 0, 100, NULL, NULL);
+		if (check_ping) {
+			fast_ping_stop(check_ping);
 			is_ipv6_ready = 1;
 			return;
 		}
-		
-		/* socket 创建失败，假设 IPv6 不可用 */
-		is_ipv6_ready = 0;
-		return;
+
+		if (errno == EADDRNOTAVAIL) {
+			is_ipv6_ready = 0;
+			return;
+		}
 	}
 
 	if (is_tcp_syn_check_set) {

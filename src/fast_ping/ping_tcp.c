@@ -44,7 +44,6 @@ int _fast_ping_sendping_tcp(struct ping_host_struct *ping_host)
 
 	fd = socket(ping_host->ss_family, SOCK_STREAM, 0);
 	if (fd < 0) {
-		tlog(TLOG_DEBUG, "tcp ping: socket failed, host: %s, errno: %d", ping_host->host, errno);
 		goto errout;
 	}
 
@@ -63,7 +62,6 @@ int _fast_ping_sendping_tcp(struct ping_host_struct *ping_host)
 	if (connect(fd, &ping_host->addr, ping_host->addr_len) != 0) {
 		if (errno != EINPROGRESS) {
 			char ping_host_name[PING_MAX_HOSTLEN];
-			tlog(TLOG_DEBUG, "tcp ping: connect failed, host: %s, errno: %d", ping_host->host, errno);
 			if (errno == ENETUNREACH || errno == EINVAL || errno == EADDRNOTAVAIL || errno == EHOSTUNREACH) {
 				goto errout;
 			}
@@ -82,23 +80,15 @@ int _fast_ping_sendping_tcp(struct ping_host_struct *ping_host)
 		}
 	}
 
-	tlog(TLOG_DEBUG, "tcp ping: connect in progress, host: %s, fd: %d, ping_host: %p", 
-	     ping_host->host, fd, ping_host);
 	gettimeofday(&ping_host->last, NULL);
 	ping_host->fd = fd;
 	memset(&event, 0, sizeof(event));
 	event.events = EPOLLIN | EPOLLOUT | EPOLLERR;
 	event.data.ptr = ping_host;
 	if (epoll_ctl(ping.epoll_fd, EPOLL_CTL_ADD, fd, &event) != 0) {
-		tlog(TLOG_DEBUG, "tcp ping: epoll_ctl failed, host: %s, errno: %d", ping_host->host, errno);
 		ping_host->fd = -1;
 		goto errout;
 	}
-
-	tlog(TLOG_DEBUG, "tcp ping: waiting for epoll events, host: %s, fd: %d, ping_host: %p", 
-	     ping_host->host, fd, ping_host);
-	tlog(TLOG_DEBUG, "tcp ping: sendping_tcp returned successfully, host: %s, fd: %d, ping_host: %p",
-	     ping_host->host, ping_host->fd, ping_host);
 
 	return 0;
 
@@ -152,10 +142,7 @@ int _fast_ping_process_tcp(struct ping_host_struct *ping_host, struct epoll_even
 	int connect_error = 0;
 	socklen_t len = sizeof(connect_error);
 
-	tlog(TLOG_DEBUG, "tcp ping: _fast_ping_process_tcp entered, host: %s, fd: %d, events: 0x%x", 
-	     ping_host->host, ping_host->fd, event->events);
-
-	if (event->events & (EPOLLIN | EPOLLOUT | EPOLLERR)) {
+	if (event->events & EPOLLIN || event->events & EPOLLERR) {
 		if (getsockopt(ping_host->fd, SOL_SOCKET, SO_ERROR, (char *)&connect_error, &len) != 0) {
 			goto errout;
 		}

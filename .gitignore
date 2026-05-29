@@ -3,8 +3,8 @@
 *.a
 *.pem
 .DS_Store
-*.swp.
-*.a
+*.swp
+*.swx
 systemd/smartdns.service
 test.bin
 package/target
@@ -12,6 +12,27 @@ package/*.gz
 package/*.ipk
 target
 data/
-third_party/curl/
+third_party/
 smartdns-geosite.conf
 .github
+
+# Temporary and test files
+*.tar
+*.tgz
+*.poc
+*.bak
+test_*
+monitor-*.sh
+start-*.sh
+Dockerfile.*
+?.workbuddy/
+wwwroot/
+*.png
+*.so
+smartdns-test-*.conf
+sub-config-*.conf
+
+# Build artifacts
+third_party/openssl/
+smartdns
+smartdns_ui.so

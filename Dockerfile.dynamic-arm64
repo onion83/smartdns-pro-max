@@ -1,0 +1,51 @@
+# Fully dynamic-linked smartdns for linux/arm64 (aarch64, musl).
+# All dependencies linked dynamically: libssl, libcrypto, libcurl, musl libc.
+# UI plugin (smartdns_ui.so) loads via dlopen() — works out of the box.
+#
+# Prerequisite: Build the base builder image ONCE:
+#   docker buildx build -f Dockerfile.builder-base-arm64 --platform linux/arm64 \
+#     --load -t smartdns-builder-arm64-base .
+#
+# Then build (~2 min):
+#   docker buildx build -f Dockerfile.dynamic-arm64 --platform linux/arm64 \
+#     --load -t smartdns-dynamic-arm64 .
+
+FROM smartdns-builder-arm64-base AS builder
+
+# Source code
+COPY Makefile /build/Makefile
+COPY src/ /build/src/
+COPY plugin/ /build/plugin/
+COPY systemd/ /build/systemd/
+COPY etc/ /build/etc/
+
+# Install shared libraries needed for dynamic linking
+# (builder-base only has static .a versions)
+RUN apk add --no-cache openssl-dev curl-dev
+
+# Build: no STATIC flag = fully dynamic linking
+# Unset local static lib paths so make uses system shared libs
+RUN cd /build && \
+    echo "=== Building smartdns (dynamic arm64) ===" && \
+    unset LOCAL_CURL_DIR LOCAL_OPENSSL_DIR && \
+    make clean && make WITH_UI=1 OPTIMIZE_SIZE=1 -j$(nproc) 2>&1 && \
+    echo "=== Done ==="
+
+# Verify outputs
+RUN echo "=== Binary info ===" && \
+    ls -lh /build/src/smartdns && file /build/src/smartdns && \
+    ldd /build/src/smartdns 2>&1 || true && \
+    echo "=== UI Plugin ===" && \
+    ls -lh /build/plugin/smartdns-ui/target/smartdns_ui.so && \
+    file /build/plugin/smartdns-ui/target/smartdns_ui.so && \
+    ldd /build/plugin/smartdns-ui/target/smartdns_ui.so 2>&1 || true && \
+    echo "=== OK ==="
+
+# --- Runtime image ---
+# Alpine provides all required shared libraries:
+#   musl libc, libssl, libcrypto, libcurl, pthread, zlib, ld-musl
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates openssl curl libgcc gdb strace
+COPY --from=builder /build/src/smartdns /usr/sbin/smartdns
+COPY --from=builder /build/plugin/smartdns-ui/target/smartdns_ui.so /usr/lib/smartdns/smartdns_ui.so
+ENTRYPOINT ["/usr/sbin/smartdns"]

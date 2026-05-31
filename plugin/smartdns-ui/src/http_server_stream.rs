@@ -28,9 +28,13 @@ use tokio_fd::AsyncFd;
 
 use crate::smartdns::*;
 use hyper_tungstenite::{tungstenite, HyperWebsocket};
+use nix::errno::Errno;
+use nix::libc::*;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tungstenite::Message;
 
 use crate::data_server::DataServer;
+use crate::dns_log;
 use crate::http_api_msg::api_msg_gen_metrics_data;
 use crate::http_server::HttpServer;
 use crate::smartdns::LogLevel;
@@ -352,8 +356,8 @@ pub async fn serve_term(websocket: HyperWebsocket) -> Result<(), Error> {
             &mut ws,
         );
         if pid < 0 {
-            dns_log!(LogLevel::ERROR, "forkpty failed, error: {}", nix::errno::Errno::last());
-            return Err(format!("forkpty failed, error: {}", nix::errno::Errno::last()).into());
+            dns_log!(LogLevel::ERROR, "forkpty failed, error: {}", Errno::last());
+            return Err(format!("forkpty failed, error: {}", Errno::last()).into());
         }
 
         if pid == 0 {
@@ -402,7 +406,7 @@ pub async fn serve_term(websocket: HyperWebsocket) -> Result<(), Error> {
                 let args = [arg0.as_ptr(), arg1.as_ptr(), arg2, std::ptr::null()];
                 let ret = execv(cmd_path.as_ptr(), args.as_ptr());
                 if ret < 0 {
-                    err = nix::errno::Errno::last_raw();
+                    err = Errno::last_raw();
                 }
                 println!("Please install `su` and add current user to sudoers");
             } else if login_path.is_ok() {
@@ -416,7 +420,7 @@ pub async fn serve_term(websocket: HyperWebsocket) -> Result<(), Error> {
                 let args = [arg0.as_ptr(), std::ptr::null()];
                 let ret = execv(cmd_path.as_ptr(), args.as_ptr());
                 if ret < 0 {
-                    err = nix::errno::Errno::last_raw();
+                    err = Errno::last_raw();
                 }
                 println!("Please install `login` and run as root");
             } else {

@@ -30,31 +30,42 @@ Tests use gtest framework, link against libsmartdns-test.a built from src/.
 orb start
 ```
 
-**Docker (requires base image first):**
+**Docker (默认使用 arm64 原生镜像，macOS Apple Silicon 无需模拟):**
 ```bash
 # Build base image ONCE (~5 min):
-docker buildx build -f Dockerfile.builder-base --platform linux/amd64 \
-  --load -t smartdns-builder-x86_64-base .
+docker buildx build -f Dockerfile.builder-base-arm64 --platform linux/arm64 \
+  --load -t smartdns-builder-arm64-base .
 
 # Build dynamic image (~2 min):
-docker buildx build -f Dockerfile.dynamic-x86_64 --platform linux/amd64 \
-  --load -t smartdns-dynamic-x86_64 .
+docker buildx build -f Dockerfile.dynamic-arm64 --platform linux/arm64 \
+  --load -t smartdns-dynamic-arm64 .
 ```
 Base image contains: musl toolchain, Rust + bindgen, static OpenSSL/libcurl.
-Dynamic image: fully dynamic linking, plugin loads via dlopen().
+Dynamic image: fully dynamic linking, plugin loads via dlopen(), runtime image includes gdb + strace.
+
+**注意**: 每次 Docker 构建前建议删除 Rust 插件 target 目录避免缓存问题：
+```bash
+rm -rf plugin/smartdns-ui/target
+```
 
 **Docker Run:**
 ```bash
-docker stop $(docker ps |awk '{print $1}'|tail -n1)
+docker stop $(docker ps -q --filter ancestor=smartdns-dynamic-arm64) 2>/dev/null
 
-docker run --rm -d \
+docker run --rm -d --name smartdns-arm64-test \
     -v /Users/onion/C/smartdns/smartdns-geosite-ui.conf:/etc/smartdns/smartdns.conf \
-    -v /Users/onion/C/smartdns/sub-conf-a.conf:/etc/smartdns/sub-conf-a.conf\
-    -v /Users/onion/C/smartdns/sub-conf-b.conf:/etc/smartdns/sub-conf-b.conf\
+    -v /Users/onion/C/smartdns/sub-conf-a.conf:/etc/smartdns/sub-conf-a.conf \
+    -v /Users/onion/C/smartdns/sub-conf-b.conf:/etc/smartdns/sub-conf-b.conf \
     -v /Users/onion/C/smartdns/data:/smartdns/data \
     -v /tmp/smartdns-lib:/var/lib/smartdns \
     -p 53:53/udp -p 53:53 -p 6080:6080 \
-    smartdns-dynamic-x86_64 smartdns -f -x
+    smartdns-dynamic-arm64 smartdns -f -x
+```
+
+**x86_64 镜像**（仅在需要 x86 环境时使用）:
+```bash
+# Base: docker buildx build -f Dockerfile.builder-base --platform linux/amd64 --load -t smartdns-builder-x86_64-base .
+# Build: DOCKER_BUILDKIT=0 docker build -f Dockerfile.dynamic-x86_64 --platform linux/amd64 -t smartdns-dynamic-x86_64 .
 ```
 
 ## Architecture Overview

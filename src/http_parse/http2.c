@@ -131,6 +131,12 @@ struct http2_stream {
 	int send_window_size;
 	int recv_window_size;
 	int body_decompressed; /* Flag to track if body has been decompressed */
+	uint8_t *pending_send_body;
+	int pending_send_body_size;
+	int pending_send_body_len;
+	int pending_send_body_offset;
+	int pending_send_end_stream;
+	int close_after_send;
 	void *ex_data;
 	struct hlist_node hash_node;
 	struct list_head node;
@@ -152,6 +158,8 @@ struct http2_ctx {
 	int settings_received;
 	int preface_received; /* Server: has received client preface */
 	uint32_t next_stream_id;
+	uint32_t max_local_stream_id_seen;
+	uint32_t max_peer_stream_id_seen;
 	int send_conn_window_size;
 	int recv_conn_window_size;
 	uint32_t peer_max_frame_size;
@@ -211,6 +219,27 @@ static struct http2_stream *_http2_find_stream(struct http2_ctx *ctx, uint32_t s
 static int _http2_stream_add_header(struct http2_stream *stream, const char *name, const char *value);
 
 /* Utility functions */
+static int _http2_is_local_stream_id(struct http2_ctx *ctx, uint32_t stream_id)
+{
+	if (stream_id == 0) {
+		return 0;
+	}
+
+	return ctx->is_client ? ((stream_id % 2) != 0) : ((stream_id % 2) == 0);
+}
+
+static int _http2_stream_id_was_seen(struct http2_ctx *ctx, uint32_t stream_id)
+{
+	if (stream_id == 0) {
+		return 0;
+	}
+
+	if (_http2_is_local_stream_id(ctx, stream_id)) {
+		return stream_id <= ctx->max_local_stream_id_seen;
+	}
+
+	return stream_id <= ctx->max_peer_stream_id_seen;
+}
 
 static uint32_t read_uint32(const uint8_t *data)
 {
@@ -825,6 +854,15 @@ static struct http2_stream *_http2_create_stream(struct http2_ctx *ctx, uint32_t
 
 	http2_stream_get(stream); /* Hold ownership for ctx */
 	pthread_mutex_lock(&ctx->mutex);
+	if (_http2_is_local_stream_id(ctx, stream_id)) {
+		if (stream_id > ctx->max_local_stream_id_seen) {
+			ctx->max_local_stream_id_seen = stream_id;
+		}
+	} else {
+		if (stream_id > ctx->max_peer_stream_id_seen) {
+			ctx->max_peer_stream_id_seen = stream_id;
+		}
+	}
 	hash_add(ctx->stream_map, &stream->hash_node, stream->stream_id);
 	list_add(&stream->node, &ctx->streams);
 	ctx->active_streams++;
@@ -874,6 +912,178 @@ static int _http2_remove_stream(struct http2_stream *stream, int do_put)
 	return 0;
 }
 
+static int _http2_stream_has_pending_send(struct http2_stream *stream)
+{
+	if (!stream) {
+		return 0;
+	}
+
+	if (stream->pending_send_body_offset < stream->pending_send_body_len) {
+		return 1;
+	}
+
+	return stream->pending_send_end_stream && !stream->end_stream_sent;
+}
+
+static void _http2_stream_clear_pending_send(struct http2_stream *stream)
+{
+	if (!stream) {
+		return;
+	}
+
+	free(stream->pending_send_body);
+	stream->pending_send_body = NULL;
+	stream->pending_send_body_size = 0;
+	stream->pending_send_body_len = 0;
+	stream->pending_send_body_offset = 0;
+	stream->pending_send_end_stream = 0;
+}
+
+static void _http2_stream_mark_end_sent(struct http2_stream *stream)
+{
+	if (!stream || stream->end_stream_sent) {
+		return;
+	}
+
+	stream->end_stream_sent = 1;
+	if (stream->state == HTTP2_STREAM_OPEN) {
+		stream->state = HTTP2_STREAM_HALF_CLOSED_LOCAL;
+	} else if (stream->state == HTTP2_STREAM_HALF_CLOSED_REMOTE) {
+		stream->state = HTTP2_STREAM_CLOSED;
+	}
+}
+
+static int _http2_stream_flush_pending_send(struct http2_stream *stream)
+{
+	struct http2_ctx *ctx;
+
+	if (!stream || !stream->ctx) {
+		return -1;
+	}
+
+	ctx = stream->ctx;
+	while (stream->pending_send_body_offset < stream->pending_send_body_len) {
+		int remain = stream->pending_send_body_len - stream->pending_send_body_offset;
+		int to_send = remain;
+
+		if (stream->send_window_size <= 0 || ctx->send_conn_window_size <= 0) {
+			errno = EAGAIN;
+			return -1;
+		}
+		if (to_send > stream->send_window_size) {
+			to_send = stream->send_window_size;
+		}
+		if (to_send > ctx->send_conn_window_size) {
+			to_send = ctx->send_conn_window_size;
+		}
+		if ((uint32_t)to_send > ctx->peer_max_frame_size) {
+			to_send = ctx->peer_max_frame_size;
+		}
+		if (to_send <= 0) {
+			errno = EAGAIN;
+			return -1;
+		}
+
+		int end_stream = stream->pending_send_end_stream && to_send == remain;
+		int ret = _http2_send_data_frame(ctx, stream->stream_id,
+										 stream->pending_send_body + stream->pending_send_body_offset, to_send,
+										 end_stream);
+		if (ret < 0) {
+			return ret;
+		}
+
+		stream->pending_send_body_offset += to_send;
+		stream->send_window_size -= to_send;
+		ctx->send_conn_window_size -= to_send;
+
+		if (end_stream) {
+			_http2_stream_mark_end_sent(stream);
+		}
+	}
+
+	if (stream->pending_send_end_stream && !stream->end_stream_sent) {
+		int ret = _http2_send_data_frame(ctx, stream->stream_id, NULL, 0, 1);
+		if (ret < 0) {
+			return ret;
+		}
+		_http2_stream_mark_end_sent(stream);
+	}
+
+	_http2_stream_clear_pending_send(stream);
+	return 0;
+}
+
+static int _http2_stream_queue_send_body(struct http2_stream *stream, const uint8_t *data, int len, int end_stream)
+{
+	int needed;
+
+	if (!stream || len < 0 || (len > 0 && !data)) {
+		return -1;
+	}
+
+	if (stream->end_stream_sent || stream->pending_send_end_stream) {
+		errno = EPIPE;
+		return -1;
+	}
+
+	needed = stream->pending_send_body_len + len;
+	if (needed > stream->pending_send_body_size) {
+		int new_size = stream->pending_send_body_size ? safe_buffer_size(stream->pending_send_body_size, 2) : 512;
+		if (new_size < 0) {
+			return -1;
+		}
+		while (new_size < needed) {
+			int temp = safe_buffer_size(new_size, 2);
+			if (temp < 0) {
+				return -1;
+			}
+			new_size = temp;
+		}
+
+		uint8_t *new_body = realloc(stream->pending_send_body, new_size);
+		if (!new_body) {
+			return -1;
+		}
+		stream->pending_send_body = new_body;
+		stream->pending_send_body_size = new_size;
+	}
+
+	if (len > 0) {
+		memcpy(stream->pending_send_body + stream->pending_send_body_len, data, len);
+		stream->pending_send_body_len += len;
+	}
+
+	if (end_stream) {
+		stream->pending_send_end_stream = 1;
+	}
+
+	return 0;
+}
+
+static void _http2_ctx_flush_pending_send_bodies(struct http2_ctx *ctx)
+{
+	struct http2_stream *stream, *tmp;
+
+	if (!ctx) {
+		return;
+	}
+
+	list_for_each_entry_safe(stream, tmp, &ctx->streams, node)
+	{
+		if (!_http2_stream_has_pending_send(stream)) {
+			continue;
+		}
+
+		if (_http2_stream_flush_pending_send(stream) < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+			continue;
+		}
+
+		if (!_http2_stream_has_pending_send(stream) && stream->close_after_send) {
+			_http2_remove_stream(stream, 1);
+		}
+	}
+}
+
 static int _http2_process_data_frame(struct http2_ctx *ctx, int stream_id, const uint8_t *data, int len, uint8_t flags)
 {
 	int ret = 0;
@@ -887,6 +1097,10 @@ static int _http2_process_data_frame(struct http2_ctx *ctx, int stream_id, const
 
 	struct http2_stream *stream = _http2_find_stream(ctx, stream_id);
 	if (!stream) {
+		if (_http2_stream_id_was_seen(ctx, stream_id)) {
+			http2_send_rst_stream(ctx, stream_id, HTTP2_RST_STREAM_CLOSED);
+			return 0;
+		}
 		http2_send_rst_stream(ctx, stream_id, HTTP2_RST_PROTOCOL_ERROR);
 		ctx->status = HTTP2_ERR_PROTOCOL;
 		return -1;
@@ -895,6 +1109,10 @@ static int _http2_process_data_frame(struct http2_ctx *ctx, int stream_id, const
 	if (stream->end_stream_received || stream->state == HTTP2_STREAM_HALF_CLOSED_REMOTE ||
 		stream->state == HTTP2_STREAM_CLOSED) {
 		http2_send_rst_stream(ctx, stream_id, HTTP2_RST_STREAM_CLOSED);
+		if (stream->state == HTTP2_STREAM_CLOSED && stream->end_stream_read_handled) {
+			_http2_mark_stream_reset(stream);
+			return 0;
+		}
 		ctx->status = HTTP2_ERR_PROTOCOL;
 		return -1;
 	}
@@ -1063,6 +1281,10 @@ static int _http2_process_headers_frame(struct http2_ctx *ctx, int stream_id, co
 		}
 	} else if (stream->end_stream_received || stream->state == HTTP2_STREAM_CLOSED) {
 		http2_send_rst_stream(ctx, stream_id, HTTP2_RST_STREAM_CLOSED);
+		if (stream->state == HTTP2_STREAM_CLOSED && stream->end_stream_read_handled) {
+			_http2_mark_stream_reset(stream);
+			return 0;
+		}
 		ctx->status = HTTP2_ERR_PROTOCOL;
 		return -1;
 	}
@@ -1247,6 +1469,7 @@ static int _http2_process_window_update_frame(struct http2_ctx *ctx, int stream_
 		}
 	}
 
+	_http2_ctx_flush_pending_send_bodies(ctx);
 	return 0;
 }
 
@@ -1597,6 +1820,7 @@ void http2_stream_put(struct http2_stream *stream)
 	}
 	_http2_free_headers(stream);
 	free(stream->body_buffer);
+	free(stream->pending_send_body);
 	free(stream);
 }
 
@@ -1854,6 +2078,7 @@ static int _http2_ctx_poll(struct http2_ctx *ctx, struct http2_poll_item *items,
 	}
 
 	int ret = _http2_ctx_io_process(ctx);
+	_http2_ctx_flush_pending_send_bodies(ctx);
 
 	if (items == NULL || max_items <= 0) {
 		pthread_mutex_unlock(&ctx->mutex);
@@ -1958,13 +2183,26 @@ void http2_stream_close(struct http2_stream *stream)
 	}
 
 	http2_stream_get(stream); /* Ensure stream survives during close */
-	/* Mark stream as closed */
-	stream->state = HTTP2_STREAM_CLOSED;
-	stream->ex_data = NULL;
-
 	struct http2_ctx *ctx = stream->ctx;
 	if (ctx) {
 		pthread_mutex_lock(&ctx->mutex);
+		if (_http2_stream_has_pending_send(stream)) {
+			stream->close_after_send = 1;
+			stream->ex_data = NULL;
+			if (_http2_stream_flush_pending_send(stream) < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+				stream->state = HTTP2_STREAM_CLOSED;
+			}
+			if (_http2_stream_has_pending_send(stream)) {
+				pthread_mutex_unlock(&ctx->mutex);
+				http2_stream_put(stream);
+				http2_stream_put(stream);
+				return;
+			}
+		}
+
+		/* Mark stream as closed */
+		stream->state = HTTP2_STREAM_CLOSED;
+		stream->ex_data = NULL;
 		int send_rst = ctx->status >= 0 && !(stream->end_stream_sent && stream->end_stream_received);
 		if (send_rst) {
 			http2_send_rst_stream(ctx, stream->stream_id, 0); /* NO_ERROR */
@@ -2187,24 +2425,32 @@ int http2_stream_write_body(struct http2_stream *stream, const uint8_t *data, in
 	}
 	pthread_mutex_lock(&ctx->mutex);
 
+	if (_http2_stream_has_pending_send(stream)) {
+		if (_http2_stream_queue_send_body(stream, data, len, end_stream) != 0) {
+			pthread_mutex_unlock(&ctx->mutex);
+			return -1;
+		}
+		if (_http2_stream_flush_pending_send(stream) < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+			pthread_mutex_unlock(&ctx->mutex);
+			return -1;
+		}
+		pthread_mutex_unlock(&ctx->mutex);
+		return len;
+	}
+
 	if (len == 0 && end_stream) {
 		if (stream->end_stream_sent) {
 			pthread_mutex_unlock(&ctx->mutex);
 			return 0;
 		}
 
-		int ret = _http2_send_data_frame(ctx, stream->stream_id, data, 0, 1);
+		int ret = _http2_send_data_frame(ctx, stream->stream_id, NULL, 0, 1);
 		if (ret < 0) {
 			pthread_mutex_unlock(&ctx->mutex);
 			return ret;
 		}
 
-		stream->end_stream_sent = 1;
-		if (stream->state == HTTP2_STREAM_OPEN) {
-			stream->state = HTTP2_STREAM_HALF_CLOSED_LOCAL;
-		} else if (stream->state == HTTP2_STREAM_HALF_CLOSED_REMOTE) {
-			stream->state = HTTP2_STREAM_CLOSED;
-		}
+		_http2_stream_mark_end_sent(stream);
 		pthread_mutex_unlock(&ctx->mutex);
 		return 0;
 	}
@@ -2217,15 +2463,15 @@ int http2_stream_write_body(struct http2_stream *stream, const uint8_t *data, in
 			return -1;
 		}
 
-		/* Check flow control */
 		if (stream->send_window_size <= 0 || ctx->send_conn_window_size <= 0) {
-			if (total_sent > 0) {
-				break; /* Partial send */
+			if (_http2_stream_queue_send_body(stream, data + total_sent, len, end_stream) != 0) {
+				pthread_mutex_unlock(&ctx->mutex);
+				return -1;
 			}
 			pthread_mutex_unlock(&ctx->mutex);
-			errno = EAGAIN;
-			return -1;
+			return total_sent + len;
 		}
+
 		int to_send = len;
 		if (to_send > stream->send_window_size) {
 			to_send = stream->send_window_size;
@@ -2233,40 +2479,40 @@ int http2_stream_write_body(struct http2_stream *stream, const uint8_t *data, in
 		if (to_send > ctx->send_conn_window_size) {
 			to_send = ctx->send_conn_window_size;
 		}
-		if ((uint32_t)to_send > (uint32_t)ctx->peer_max_frame_size) {
+		if ((uint32_t)to_send > ctx->peer_max_frame_size) {
 			to_send = ctx->peer_max_frame_size;
 		}
-
 		if (to_send <= 0) {
-			if (total_sent > 0) {
-				break;
+			if (_http2_stream_queue_send_body(stream, data + total_sent, len, end_stream) != 0) {
+				pthread_mutex_unlock(&ctx->mutex);
+				return -1;
 			}
 			pthread_mutex_unlock(&ctx->mutex);
-			errno = EAGAIN;
-			return -1;
+			return total_sent + len;
 		}
 
-		int ret =
-			_http2_send_data_frame(ctx, stream->stream_id, data + total_sent, to_send, end_stream && to_send == len);
+		int is_end = end_stream && to_send == len;
+		int ret = _http2_send_data_frame(ctx, stream->stream_id, data + total_sent, to_send, is_end);
 		if (ret < 0) {
-			if (total_sent > 0) {
-				break; /* Partial send */
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				if (_http2_stream_queue_send_body(stream, data + total_sent, len, end_stream) != 0) {
+					pthread_mutex_unlock(&ctx->mutex);
+					return -1;
+				}
+				pthread_mutex_unlock(&ctx->mutex);
+				return total_sent + len;
 			}
 			pthread_mutex_unlock(&ctx->mutex);
 			return ret;
 		}
+
 		total_sent += to_send;
 		len -= to_send;
 		stream->send_window_size -= to_send;
 		ctx->send_conn_window_size -= to_send;
 
-		if (end_stream && len == 0) {
-			stream->end_stream_sent = 1;
-			if (stream->state == HTTP2_STREAM_OPEN) {
-				stream->state = HTTP2_STREAM_HALF_CLOSED_LOCAL;
-			} else if (stream->state == HTTP2_STREAM_HALF_CLOSED_REMOTE) {
-				stream->state = HTTP2_STREAM_CLOSED;
-			}
+		if (is_end) {
+			_http2_stream_mark_end_sent(stream);
 		}
 	}
 
@@ -2423,6 +2669,8 @@ int http2_stream_read_body(struct http2_stream *stream, uint8_t *data, int len)
 	int decompress_ret = http2_try_decompress_body(stream);
 	if (decompress_ret < 0) {
 		/* Decompression failed, return error */
+		stream->end_stream_read_handled = 1;
+		stream->body_read_offset = stream->body_buffer_len;
 		if (ctx) {
 			pthread_mutex_unlock(&ctx->mutex);
 		}

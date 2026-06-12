@@ -52,7 +52,7 @@ RUN cd /opt/openssl/lib && \
 # --- Runtime image ---
 # Copy dynamic libraries from builder, install only runtime deps (no -dev)
 FROM alpine:3.24
-RUN apk add --no-cache ca-certificates libgcc gdb strace
+RUN apk add --no-cache ca-certificates binutils bind-tools
 # Copy OpenSSL and curl shared libraries from builder (using .runtime symlinks)
 COPY --from=builder /opt/openssl/lib/libssl.so.runtime /usr/lib/libssl.so
 COPY --from=builder /opt/openssl/lib/libcrypto.so.runtime /usr/lib/libcrypto.so
@@ -85,4 +85,9 @@ RUN SONAME_SSL=$(readelf -d /usr/lib/libssl.so 2>/dev/null | grep SONAME | awk '
     fi
 COPY --from=builder /build/src/smartdns /usr/sbin/smartdns
 COPY --from=builder /build/plugin/smartdns-ui/target/smartdns_ui.so /usr/lib/smartdns/smartdns_ui.so
+
+# Copy openssl and curl binaries from builder for debugging
+COPY --from=builder /opt/openssl/bin/openssl /usr/bin/openssl
+COPY --from=builder /opt/curl/bin/curl /usr/bin/curl
+
 ENTRYPOINT ["/usr/sbin/smartdns"]

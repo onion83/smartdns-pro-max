@@ -15,6 +15,7 @@ data/
 third_party/
 smartdns-geosite.conf
 .github
+_nouse
 
 # Temporary and test files
 *.tar

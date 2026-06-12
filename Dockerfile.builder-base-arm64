@@ -4,8 +4,16 @@
 # Build ONCE (takes ~5 min):
 #   docker buildx build -f Dockerfile.builder-base-arm64 --platform linux/arm64 \
 #     -t smartdns-builder-arm64-base .
+#
+# To build with different versions:
+#   docker buildx build --build-arg OPENSSL_VERSION=4.0.0 --build-arg CURL_VERSION=8.19.0 \
+#     -f Dockerfile.builder-base-arm64 --platform linux/arm64 -t smartdns-builder-arm64-base .
 
-FROM --platform=linux/arm64 alpine:3.19 AS base
+FROM --platform=linux/arm64 alpine:3.24 AS base
+
+# Version arguments (override with --build-arg)
+ARG OPENSSL_VERSION=4.0.1
+ARG CURL_VERSION=8.20.0
 
 # --- C build tools ---
 RUN apk add --no-cache \
@@ -15,43 +23,58 @@ RUN apk add --no-cache \
     zlib-static \
     pkgconf \
     git \
-    curl \
     ca-certificates \
-    perl
+    perl \
+    wget
 
 # --- Rust toolchain (rustup + musl target + bindgen) ---
 RUN apk add --no-cache \
-    llvm15-dev \
+    llvm-dev \
     clang \
-    clang15-dev && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
+    clang-dev \
+    wget && \
+    wget -qO- https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
     . /root/.cargo/env && \
     rustup target add aarch64-unknown-linux-musl && \
     cargo install bindgen-cli 2>&1 | tail -3 && \
     echo "=== Base ready ===" && rustc --version && cargo version
 
-# --- Static OpenSSL (installed to /opt/openssl) ---
+# --- OpenSSL (installed to /opt/openssl, both static and shared) ---
 COPY third_party/build_openssl.sh /tmp/build_openssl.sh
 RUN chmod +x /tmp/build_openssl.sh && \
-    LOCAL_OPENSSL_INSTALL=/opt/openssl /tmp/build_openssl.sh && \
+    LOCAL_OPENSSL_INSTALL=/opt/openssl /tmp/build_openssl.sh ${OPENSSL_VERSION} both && \
     rm -f /tmp/build_openssl.sh && \
-    ls /opt/openssl/lib*/lib*.a 2>/dev/null || false && \
-    ln -sf /opt/openssl/lib64 /opt/openssl/lib 2>/dev/null || true
+    ls /opt/openssl/lib/lib*.a /opt/openssl/lib/lib*.so 2>/dev/null || true
 
-# --- Static libcurl (linked against static OpenSSL) ---
+# --- libcurl (installed to /opt/curl, both static and shared) ---
 COPY third_party/build_curl.sh /tmp/build_curl.sh
 RUN chmod +x /tmp/build_curl.sh && \
     export LIBS="-ldl -lpthread" && \
     LOCAL_CURL_INSTALL=/opt/curl \
     LOCAL_OPENSSL_INSTALL=/opt/openssl \
-    /tmp/build_curl.sh && \
+    /tmp/build_curl.sh ${CURL_VERSION} both && \
     rm -f /tmp/build_curl.sh
+
+# Symlink shared libraries to /usr/lib so dynamic linker can find them
+# This allows /opt/curl/bin/curl and other dynamic-linked binaries to work
+RUN for lib in /opt/openssl/lib/*.so*; do \
+        ln -sf "$lib" /usr/lib/ 2>/dev/null || true; \
+    done && \
+    for lib in /opt/curl/lib/*.so*; do \
+        ln -sf "$lib" /usr/lib/ 2>/dev/null || true; \
+    done && \
+    echo "Symlinked OpenSSL and CURL shared libraries to /usr/lib"
+
+# Symlink binaries to /usr/local/bin for direct access (debugging convenience)
+RUN ln -sf /opt/openssl/bin/openssl /usr/local/bin/openssl && \
+    ln -sf /opt/curl/bin/curl /usr/local/bin/curl && \
+    echo "Symlinked openssl and curl to /usr/local/bin"
 
 # --- Persistent env for all child images ---
 ENV LOCAL_CURL_DIR=/opt/curl
 ENV LOCAL_OPENSSL_DIR=/opt/openssl
 ENV NO_GIT_VER=1
-ENV PATH="/root/.cargo/bin:${PATH}"
+ENV PATH="/root/.cargo/bin:/opt/openssl/bin:/opt/curl/bin:${PATH}"
 
 WORKDIR /build
 

@@ -19,15 +19,12 @@ COPY plugin/ /build/plugin/
 COPY systemd/ /build/systemd/
 COPY etc/ /build/etc/
 
-# Install shared libraries needed for dynamic linking
-# (builder-base only has static .a versions)
-RUN apk add --no-cache openssl-dev curl-dev
-
-# Build: no STATIC flag = fully dynamic linking
-# Unset local static lib paths so make uses system shared libs
+# Build: dynamic linking against /opt/curl and /opt/openssl
+# Makefile auto-detects LOCAL_DEPS_PREFIX=/opt (set in main Makefile)
+# NO static/hybrid flags → dynamic linking with -lssl -lcrypto -lcurl
+# RPATH is auto-added by src/Makefile for runtime .so discovery
 RUN cd /build && \
     echo "=== Building smartdns (dynamic arm64) ===" && \
-    unset LOCAL_CURL_DIR LOCAL_OPENSSL_DIR && \
     make clean && make WITH_UI=1 OPTIMIZE_SIZE=1 -j$(nproc) 2>&1 && \
     echo "=== Done ==="
 
@@ -41,11 +38,51 @@ RUN echo "=== Binary info ===" && \
     ldd /build/plugin/smartdns-ui/target/smartdns_ui.so 2>&1 || true && \
     echo "=== OK ==="
 
+# Create fixed symlinks for runtime .so files (version-agnostic)
+# OpenSSL and CURL .so version numbers change between versions;
+# we create .so.runtime symlinks that always point to the actual .so files.
+RUN cd /opt/openssl/lib && \
+    ln -sf libssl.so.* libssl.so.runtime && \
+    ln -sf libcrypto.so.* libcrypto.so.runtime && \
+    echo "OpenSSL .so: $(ls -lh libssl.so.*)" && \
+    cd /opt/curl/lib && \
+    ln -sf libcurl.so.* libcurl.so.runtime && \
+    echo "CURL .so: $(ls -lh libcurl.so.*)"
+
 # --- Runtime image ---
-# Alpine provides all required shared libraries:
-#   musl libc, libssl, libcrypto, libcurl, pthread, zlib, ld-musl
-FROM alpine:3.19
-RUN apk add --no-cache ca-certificates openssl curl libgcc gdb strace
+# Copy dynamic libraries from builder, install only runtime deps (no -dev)
+FROM alpine:3.24
+RUN apk add --no-cache ca-certificates libgcc gdb strace
+# Copy OpenSSL and curl shared libraries from builder (using .runtime symlinks)
+COPY --from=builder /opt/openssl/lib/libssl.so.runtime /usr/lib/libssl.so
+COPY --from=builder /opt/openssl/lib/libcrypto.so.runtime /usr/lib/libcrypto.so
+COPY --from=builder /opt/curl/lib/libcurl.so.runtime /usr/lib/libcurl.so
+# The .runtime files are actual .so files (via symlink), need to find actual SONAME
+# Extract SONAME from the .runtime files and create proper symlinks
+RUN SONAME_SSL=$(readelf -d /usr/lib/libssl.so 2>/dev/null | grep SONAME | awk '{print $NF}' | tr -d '[]') && \
+    if [ -n "$SONAME_SSL" ]; then \
+        mv /usr/lib/libssl.so /usr/lib/$SONAME_SSL && \
+        ln -sf $SONAME_SSL /usr/lib/libssl.so && \
+        echo "OpenSSL SONAME: $SONAME_SSL"; \
+    else \
+        echo "WARNING: could not determine OpenSSL SONAME"; \
+    fi && \
+    SONAME_CRYPTO=$(readelf -d /usr/lib/libcrypto.so 2>/dev/null | grep SONAME | awk '{print $NF}' | tr -d '[]') && \
+    if [ -n "$SONAME_CRYPTO" ]; then \
+        mv /usr/lib/libcrypto.so /usr/lib/$SONAME_CRYPTO && \
+        ln -sf $SONAME_CRYPTO /usr/lib/libcrypto.so && \
+        echo "Crypto SONAME: $SONAME_CRYPTO"; \
+    else \
+        echo "WARNING: could not determine Crypto SONAME"; \
+    fi && \
+    SONAME_CURL=$(readelf -d /usr/lib/libcurl.so 2>/dev/null | grep SONAME | awk '{print $NF}' | tr -d '[]') && \
+    if [ -n "$SONAME_CURL" ]; then \
+        mv /usr/lib/libcurl.so /usr/lib/$SONAME_CURL && \
+        ln -sf $SONAME_CURL /usr/lib/libcurl.so && \
+        echo "CURL SONAME: $SONAME_CURL"; \
+    else \
+        echo "WARNING: could not determine CURL SONAME"; \
+    fi
 COPY --from=builder /build/src/smartdns /usr/sbin/smartdns
 COPY --from=builder /build/plugin/smartdns-ui/target/smartdns_ui.so /usr/lib/smartdns/smartdns_ui.so
 ENTRYPOINT ["/usr/sbin/smartdns"]

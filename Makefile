@@ -20,12 +20,20 @@ SBINDIR := $(PREFIX)/sbin
 SLIBDIR := $(PREFIX)/lib
 SYSCONFDIR := /etc
 RUNSTATEDIR := /run
-SYSTEMDSYSTEMUNITDIR := $(shell ${PKG_CONFIG} --variable=systemdsystemunitdir systemd)
+SYSTEMDSYSTEMUNITDIR := $(shell ${PKG_CONFIG} --variable=systemdsystemunitdir systemd 2>/dev/null)
 SMARTDNS_SYSTEMD = systemd/smartdns.service
 
-export PKG_CONFIG_PATH=/opt/openssl/lib64/pkgconfig
-export CFLAGS := $(shell pkg-config --cflags openssl)
-export LDFLAGS := $(shell pkg-config --libs openssl)
+# Custom dependency prefix (for OpenSSL, CURL built from source).
+# Set to /opt by default; override with: make LOCAL_DEPS_PREFIX=/your/path
+LOCAL_DEPS_PREFIX ?= /opt
+
+# Whether to allow falling back to system libraries (apk/apt/dnf installed).
+# Set to 0 to NEVER use system libraries; set to 1 to allow fallback.
+# When LOCAL_DEPS_PREFIX is set and libraries are found there, system libs are NOT used regardless.
+USE_SYSTEM_LIBS ?= 0
+
+export LOCAL_DEPS_PREFIX
+export USE_SYSTEM_LIBS
 
 ifneq ($(strip $(DESTDIR)),)
 $(shell mkdir -p $(DESTDIR) -m 0755)

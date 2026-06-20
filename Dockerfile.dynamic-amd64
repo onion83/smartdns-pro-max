@@ -1,0 +1,93 @@
+# Fully dynamic-linked smartdns for linux/amd64 (x86_64, musl).
+# All dependencies linked dynamically: libssl, libcrypto, libcurl, musl libc.
+# UI plugin (smartdns_ui.so) loads via dlopen() — works out of the box.
+#
+# Prerequisite: Build the base builder image ONCE:
+#   docker buildx build -f Dockerfile.builder-base-amd64 --platform linux/amd64 \
+#     --load -t smartdns-builder-amd64-base .
+#
+# Then build (~2 min):
+#   docker buildx build -f Dockerfile.dynamic-amd64 --platform linux/amd64 \
+#     --load -t smartdns-dynamic-amd64 .
+
+FROM smartdns-builder-amd64-base AS builder
+
+# Source code
+COPY Makefile /build/Makefile
+COPY src/ /build/src/
+COPY plugin/ /build/plugin/
+COPY systemd/ /build/systemd/
+COPY etc/ /build/etc/
+
+# Build: dynamic linking against /opt/curl and /opt/openssl
+# Makefile auto-detects LOCAL_DEPS_PREFIX=/opt (set in main Makefile)
+# NO static/hybrid flags → dynamic linking with -lssl -lcrypto -lcurl
+# RPATH is auto-added by src/Makefile for runtime .so discovery
+RUN cd /build && \
+    echo "=== Building smartdns (dynamic amd64) ===" && \
+    make clean && make WITH_UI=1 OPTIMIZE_SIZE=1 -j$(nproc) 2>&1 && \
+    echo "=== Done ==="
+
+# Verify outputs
+RUN echo "=== Binary info ===" && \
+    ls -lh /build/src/smartdns && file /build/src/smartdns && \
+    ldd /build/src/smartdns 2>&1 || true && \
+    echo "=== UI Plugin ===" && \
+    ls -lh /build/plugin/smartdns-ui/target/smartdns_ui.so && \
+    file /build/plugin/smartdns-ui/target/smartdns_ui.so && \
+    ldd /build/plugin/smartdns-ui/target/smartdns_ui.so 2>&1 || true && \
+    echo "=== OK ==="
+
+# Create fixed symlinks for runtime .so files (version-agnostic)
+# OpenSSL and CURL .so version numbers change between versions;
+# we create .so.runtime symlinks that always point to the actual .so files.
+RUN cd /opt/openssl/lib && \
+    ln -sf libssl.so.* libssl.so.runtime && \
+    ln -sf libcrypto.so.* libcrypto.so.runtime && \
+    echo "OpenSSL .so: $(ls -lh libssl.so.*)" && \
+    cd /opt/curl/lib && \
+    ln -sf libcurl.so.* libcurl.so.runtime && \
+    echo "CURL .so: $(ls -lh libcurl.so.*)"
+
+# --- Runtime image ---
+# Copy dynamic libraries from builder, install only runtime deps (no -dev)
+FROM alpine:3.24
+RUN apk add --no-cache ca-certificates binutils bind-tools
+# Copy OpenSSL and curl shared libraries from builder (using .runtime symlinks)
+COPY --from=builder /opt/openssl/lib/libssl.so.runtime /usr/lib/libssl.so
+COPY --from=builder /opt/openssl/lib/libcrypto.so.runtime /usr/lib/libcrypto.so
+COPY --from=builder /opt/curl/lib/libcurl.so.runtime /usr/lib/libcurl.so
+# The .runtime files are actual .so files (via symlink), need to find actual SONAME
+# Extract SONAME from the .runtime files and create proper symlinks
+RUN SONAME_SSL=$(readelf -d /usr/lib/libssl.so 2>/dev/null | grep SONAME | awk '{print $NF}' | tr -d '[]') && \
+    if [ -n "$SONAME_SSL" ]; then \
+        mv /usr/lib/libssl.so /usr/lib/$SONAME_SSL && \
+        ln -sf $SONAME_SSL /usr/lib/libssl.so && \
+        echo "OpenSSL SONAME: $SONAME_SSL"; \
+    else \
+        echo "WARNING: could not determine OpenSSL SONAME"; \
+    fi && \
+    SONAME_CRYPTO=$(readelf -d /usr/lib/libcrypto.so 2>/dev/null | grep SONAME | awk '{print $NF}' | tr -d '[]') && \
+    if [ -n "$SONAME_CRYPTO" ]; then \
+        mv /usr/lib/libcrypto.so /usr/lib/$SONAME_CRYPTO && \
+        ln -sf $SONAME_CRYPTO /usr/lib/libcrypto.so && \
+        echo "Crypto SONAME: $SONAME_CRYPTO"; \
+    else \
+        echo "WARNING: could not determine Crypto SONAME"; \
+    fi && \
+    SONAME_CURL=$(readelf -d /usr/lib/libcurl.so 2>/dev/null | grep SONAME | awk '{print $NF}' | tr -d '[]') && \
+    if [ -n "$SONAME_CURL" ]; then \
+        mv /usr/lib/libcurl.so /usr/lib/$SONAME_CURL && \
+        ln -sf $SONAME_CURL /usr/lib/libcurl.so && \
+        echo "CURL SONAME: $SONAME_CURL"; \
+    else \
+        echo "WARNING: could not determine CURL SONAME"; \
+    fi
+COPY --from=builder /build/src/smartdns /usr/sbin/smartdns
+COPY --from=builder /build/plugin/smartdns-ui/target/smartdns_ui.so /usr/lib/smartdns/smartdns_ui.so
+
+# Copy openssl and curl binaries from builder for debugging
+COPY --from=builder /opt/openssl/bin/openssl /usr/bin/openssl
+COPY --from=builder /opt/curl/bin/curl /usr/bin/curl
+
+ENTRYPOINT ["/usr/sbin/smartdns"]

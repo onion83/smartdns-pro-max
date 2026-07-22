@@ -37,3 +37,10 @@ sub-config-*.conf
 third_party/openssl/
 smartdns
 smartdns_ui.so.workbuddy/
+
+# Release build files and scripts
+build-static.sh
+smartdns-*
+*.ipk
+*.apk
+*.deb

@@ -801,14 +801,20 @@ int dns_server_run(void)
 			}
 
 #ifdef __linux__
-			if (unlikely(event->data.fd == geosite_get_download_event_fd())) {
-				uint64_t value;
-				int unused __attribute__((unused));
-				unused = read(geosite_get_download_event_fd(), &value, sizeof(uint64_t));
-				geosite_reload_rules();
-				continue;
-			}
+		if (unlikely(event->data.fd == geosite_get_download_event_fd())) {
+			uint64_t value;
+			int unused __attribute__((unused));
+			unused = read(geosite_get_download_event_fd(), &value, sizeof(uint64_t));
+			geosite_reload_rules();
+			continue;
+		}
 #endif
+
+		/* neighbor table event */
+		if (unlikely(event->data.fd == server.neigh_netlink_fd)) {
+			_dns_server_process_neighbor_cache_event();
+			continue;
+		}
 
 			struct dns_server_conn_head *conn_head = event->data.ptr;
 			if (conn_head == NULL) {
@@ -895,6 +901,7 @@ int dns_server_init(void)
 	}
 
 	memset(&server, 0, sizeof(server));
+	server.neigh_netlink_fd = -1;
 
 	pthread_mutexattr_init(&attr);
 	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);

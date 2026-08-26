@@ -203,3 +203,4 @@ npm run lint             # ESLint
 - Docker container with config file mounts
 - Frontend dev server proxying to container's API port
 - 根据修改的文件，确认是否需要重新编译 rust 插件，然后重新启动容器（如有运行实例可以自动kill掉），然后再访问前端页面，查看是否生效
+- 不要试图在 macos 环境下编译，一定要使用 docker 环境（orb start）

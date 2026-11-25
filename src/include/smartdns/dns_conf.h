@@ -108,6 +108,7 @@ enum domain_rule {
 enum ip_rule {
 	IP_RULE_FLAGS = 0,
 	IP_RULE_ALIAS = 1,
+	IP_RULE_CNAME = 2,
 	IP_RULE_MAX,
 };
 
@@ -279,6 +280,7 @@ extern struct dns_nftset_names dns_conf_nftset;
 
 struct dns_domain_rule {
 	unsigned char capacity;   /* Current allocated capacity (max 255) */
+	atomic32_t refcnt;        /* ART leaves, groups and the immutable-rule pool; fits the padding */
 	struct dns_rule *rules[]; /* Flexible array member */
 };
 
@@ -567,6 +569,7 @@ struct dns_conf_group {
 	struct hlist_node node;
 	struct dns_conf_domain_rule domain_rule;
 	struct dns_conf_address_rule address_rule;
+	int has_ip_rule_cname;
 	uint8_t *soa_table;
 	/* === AUTO COPY FIELD BEGIN === */
 	char copy_data_section_begin[0];
@@ -710,6 +713,11 @@ struct ip_rule_flags {
 struct ip_rule_alias {
 	struct dns_ip_rule head;
 	struct dns_iplist_ip_addresses ip_alias;
+};
+
+struct ip_rule_cname {
+	struct dns_ip_rule head;
+	char cname[DNS_MAX_CNAME_LEN];
 };
 
 struct dns_ip_set_name {

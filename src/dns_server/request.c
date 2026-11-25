@@ -419,9 +419,13 @@ int dns_server_request_is_blocked(struct dns_request *request)
 		return 0;
 	}
 
+	if (request->force_soa) {
+		return 1;
+	}
+
 	if (request->qtype == DNS_T_HTTPS || request->qtype == DNS_T_SVCB) {
 		uint32_t flags = _dns_server_get_rule_flags(request);
-		if (flags & DOMAIN_FLAG_ADDR_HTTPS_SOA) {
+		if (flags & (DOMAIN_FLAG_ADDR_HTTPS_SOA | DOMAIN_FLAG_ADDR_SOA)) {
 			return 1;
 		}
 		return 0;
@@ -797,6 +801,8 @@ int _dns_server_pre_process_server_flags(struct dns_request *request)
 	}
 
 	if (request->qtype == DNS_T_HTTPS && _dns_server_has_bind_flag(request, BIND_FLAG_FORCE_HTTPS_SOA) == 0) {
+		stats_inc(&dns_stats.request.blocked_count);
+		request->force_soa = 1;
 		_dns_server_reply_SOA(DNS_RC_NOERROR, request);
 		return 0;
 	}
@@ -825,6 +831,7 @@ struct dns_request *_dns_server_new_child_request(struct dns_request *request, c
 	child_request->qtype = qtype;
 	child_request->qclass = request->qclass;
 	child_request->conf = request->conf;
+	child_request->no_ip_rule_cname = request->no_ip_rule_cname;
 
 	if (request->has_ecs) {
 		memcpy(&child_request->ecs, &request->ecs, sizeof(child_request->ecs));
@@ -1154,6 +1161,10 @@ void _dns_server_check_set_passthrough(struct dns_request *request)
 		(request->qtype == DNS_T_A || request->qtype == DNS_T_AAAA || request->qtype == DNS_T_HTTPS) &&
 		request->edns0_do == 0) {
 		request->passthrough = 2;
+	}
+
+	if ((request->qtype == DNS_T_A || request->qtype == DNS_T_AAAA) && request->conf->has_ip_rule_cname) {
+		request->passthrough = 0;
 	}
 }
 

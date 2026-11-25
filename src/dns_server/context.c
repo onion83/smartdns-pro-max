@@ -118,6 +118,9 @@ static int _dns_rrs_add_all_best_ip(struct dns_server_post_context *context)
 	if (request->passthrough == 2) {
 		ignore_speed = 1;
 	}
+	if (request->ip_rule_cname[0] != '\0') {
+		ignore_speed = 1;
+	}
 
 	while (true) {
 		pthread_mutex_lock(&request->ip_map_lock);
@@ -669,6 +672,11 @@ static int _dns_server_setup_ipset_nftset_packet(struct dns_server_post_context 
 		timeout_value = _dns_server_get_conf_ttl(request, 0) * 3;
 	}
 
+	/* expired cache answers are still replied: keep the address in the set while they may be served */
+	if (request->conf->dns_serve_expired && request->conf->dns_serve_expired_ttl > 0) {
+		timeout_value += request->conf->dns_serve_expired_ttl;
+	}
+
 	if (conf->ipset_nftset.ipset_timeout_enable) {
 		ipset_timeout_value = timeout_value;
 	}
@@ -777,6 +785,10 @@ static int _dns_result_child_post(struct dns_server_post_context *context)
 		parent_context.do_reply = context->do_reply;
 		parent_context.reply_ttl = context->reply_ttl;
 		parent_context.cache_ttl = context->cache_ttl;
+		if (parent_request->ip_rule_cname[0] != '\0' && parent_request->ip_ttl > 0) {
+			parent_context.reply_ttl = parent_request->ip_ttl;
+			parent_context.cache_ttl = parent_request->ip_ttl;
+		}
 		parent_context.skip_notify_count = context->skip_notify_count;
 		parent_context.select_all_best_ip = 1;
 		parent_context.no_release_parent = context->no_release_parent;

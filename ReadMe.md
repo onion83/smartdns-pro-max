@@ -139,6 +139,11 @@ SmartDNS 同样提供编译脚本（`package/build-pkg.sh`），支持 LuCI、De
 
 **WebUI**：本分支配套的 WebUI 前端见独立仓库 [onion83/smartdns-webui](https://github.com/onion83/smartdns-webui)，插件形态源码见 [smartdns-ui 插件](plugin/smartdns-ui/)，基于 Next.js 构建（`npm run build`）。
 
+## 文档
+
+- [设计意图与开发历史](doc/design-and-history.md)（[English](doc/design-and-history_en.md)） — 本分支的设计目标、架构分层、主要历史修改与踩坑记录
+- [Geosite 配置说明](doc/geosite-config.md)（[English](doc/geosite-config_en.md)） — `geosite-updater` / `geosite-dat` / `geosite-set` / `domain-rules` 完整语法指令与参数说明
+
 ## 上游使用文档
 
 完整配置文档请参考上游官网：[https://pymumu.github.io/smartdns](https://pymumu.github.io/smartdns)

@@ -1,5 +1,7 @@
 # Geosite 配置说明
 
+> English version: [geosite-config_en.md](geosite-config_en.md)
+
 Geosite 模块提供基于域名列表的分组规则管理，支持本地文件和远程 URL 数据源，
 以及运行时热更新（自动下载、diff 比较、增量删除/添加规则、清除对应 DNS 缓存）。
 

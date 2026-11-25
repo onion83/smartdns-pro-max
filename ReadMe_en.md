@@ -139,6 +139,11 @@ SmartDNS also provides packaging scripts (`package/build-pkg.sh`) for LuCI, Debi
 
 **WebUI**: the companion WebUI frontend lives in the separate repo [onion83/smartdns-webui](https://github.com/onion83/smartdns-webui); the in-plugin source is under [smartdns-ui plugin](plugin/smartdns-ui/), built with Next.js (`npm run build`).
 
+## Documentation
+
+- [Design Intent and Development History](doc/design-and-history_en.md) ([中文](doc/design-and-history.md)) — design goals, architecture layers, major development history, and pitfalls solved in this fork
+- [Geosite Configuration Guide](doc/geosite-config_en.md) ([中文](doc/geosite-config.md)) — full syntax and parameters of `geosite-updater` / `geosite-dat` / `geosite-set` / `domain-rules`
+
 ## Upstream Documentation
 
 For full configuration documentation, see the upstream site: [https://pymumu.github.io/smartdns](https://pymumu.github.io/smartdns)

@@ -29,6 +29,7 @@
 #include "set_file.h"
 #include "smartdns/lib/stringutil.h"
 #include "smartdns/util.h"
+#include "smartdns/dns_cache.h"
 #include "speed_check_mode.h"
 #include "txt_record.h"
 
@@ -1622,6 +1623,13 @@ static void _fill_dns_server_list(const char *group_name, struct domain_rule_che
 					snprintf(result->servers[i], DNS_SERVER_INFO_STR_LEN, "%s%s:%d", prefix, s->server, s->port);
 				else
 					snprintf(result->servers[i], DNS_SERVER_INFO_STR_LEN, "%s%s", prefix, s->server);
+				if (s->fallback) {
+					size_t srv_len = strlen(result->servers[i]);
+					if (srv_len < DNS_SERVER_INFO_STR_LEN - 1) {
+						result->servers[i][srv_len] = '*';
+						result->servers[i][srv_len + 1] = '\0';
+					}
+				}
 				result->server_num++;
 			}
 			break;
@@ -1810,6 +1818,13 @@ static void _parse_server_addr(const char *server_str, char *ip, int ip_len, int
 	char buf[DNS_MAX_IPLEN];
 	safe_strncpy(buf, p, sizeof(buf));
 
+	/* Strip trailing '*' (fallback server marker added by
+	 * dns_conf_get_check_servers) before parsing the address. */
+	size_t buf_len = strlen(buf);
+	while (buf_len > 0 && buf[buf_len - 1] == '*') {
+		buf[--buf_len] = '\0';
+	}
+
 	/* Count colons to detect IPv6 */
 	int colon_count = 0;
 	const char *q = buf;
@@ -1821,17 +1836,14 @@ static void _parse_server_addr(const char *server_str, char *ip, int ip_len, int
 
 	if (colon_count >= 2) {
 		/* This is an IPv6 address */
-		/* Check if there's a port after the last colon */
-		/* For IPv6, port must be specified after a single colon at the end */
-		/* e.g., ::1:53 or ::1:0:53 */
-		/* We'll assume no port for bare IPv6, or port is after the last colon if it looks like a port */
-		safe_strncpy(ip, buf, ip_len);
-		/* Try to detect port: if the part after the last colon is a pure number, treat as port */
+		/* Bare IPv6 addresses often end with a numeric-only group (e.g.
+		 * ...:68), so do not treat the trailing number as a port blindly.
+		 * Only accept it as a port when the remaining prefix is a valid
+		 * IPv6 address (e.g. "[::1]:53" without brackets, "240e::1:5353"). */
 		char *last_colon = strrchr(buf, ':');
 		if (last_colon != NULL) {
 			char *after_colon = last_colon + 1;
 			if (after_colon[0] != '\0') {
-				/* Check if after_colon is a pure number */
 				int is_num = 1;
 				for (char *c = after_colon; *c; c++) {
 					if (*c < '0' || *c > '9') {
@@ -1840,13 +1852,18 @@ static void _parse_server_addr(const char *server_str, char *ip, int ip_len, int
 					}
 				}
 				if (is_num && strlen(after_colon) <= 5) {
-					/* It's a port number */
-					*last_colon = '\0';
-					*port = atoi(after_colon);
-					safe_strncpy(ip, buf, ip_len);
+					char addr_buf[DNS_MAX_IPLEN];
+					struct in6_addr probe;
+
+					safe_strncpy(addr_buf, buf, (size_t)(last_colon - buf) + 1);
+					if (inet_pton(AF_INET6, addr_buf, &probe) == 1) {
+						*last_colon = '\0';
+						*port = atoi(after_colon);
+					}
 				}
 			}
 		}
+		safe_strncpy(ip, buf, ip_len);
 	} else {
 		/* IPv4 address */
 		char *colon = strrchr(buf, ':');
@@ -1933,7 +1950,317 @@ static int _resolve_udp_query(const char *server_ip, int server_port, const char
 }
 
 /* Parse DNS response into a query result struct. */
-static void _resolve_parse_response(unsigned char *data, int data_len, struct dns_server_query_result *qr)
+/* Append a piece of record data text to the result, comma-separated. */
+/* Append formatted text to a growable buffer, keeping it NUL-terminated. */
+static void _resolve_buf_append(char *buf, int buf_size, const char *fmt, ...)
+{
+	int len = (int)strlen(buf);
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf + len, buf_size - len, fmt, ap);
+	va_end(ap);
+}
+
+static void _resolve_append_rdata(struct dns_server_query_result *qr, const char *text)
+{
+	if (text == NULL || text[0] == '\0') {
+		return;
+	}
+	if (qr->rdata[0] != '\0') {
+		strlcat(qr->rdata, ", ", sizeof(qr->rdata));
+	}
+	strlcat(qr->rdata, text, sizeof(qr->rdata));
+}
+
+/* Read a (possibly compressed) domain name from a wire-format DNS packet.
+ * On success advances *pos past the name (only when no compression pointer
+ * was followed) and returns the length of the name written. */
+static int _resolve_wire_read_name(const unsigned char *pkt, int pkt_len, int *pos, char *name, int name_size)
+{
+	int cur = *pos;
+	int jumped = 0;
+	int next = -1;
+	int len = 0;
+	int jumps = 0;
+
+	name[0] = '\0';
+	while (cur < pkt_len && jumps < 128) {
+		unsigned char c = pkt[cur];
+		if (c == 0) {
+			cur++;
+			/* advance past the whole name: either just the non-compressed
+			 * labels, or the first two bytes of the compression pointer */
+			*pos = jumped ? next : cur;
+			return len;
+		}
+		if ((c & 0xC0) == 0xC0) {
+			if (cur + 1 >= pkt_len) {
+				return -1;
+			}
+			int ptr = ((c & 0x3F) << 8) | pkt[cur + 1];
+			if (!jumped) {
+				next = cur + 2;
+			}
+			jumped = 1;
+			jumps++;
+			if (ptr >= pkt_len || ptr < 12) {
+				return -1;
+			}
+			cur = ptr;
+			continue;
+		}
+		if ((c & 0xC0) != 0 || cur + 1 + c > pkt_len) {
+			return -1;
+		}
+		if (len + c + 2 >= name_size) {
+			return -1;
+		}
+		if (len > 0) {
+			name[len++] = '.';
+		}
+		memcpy(name + len, pkt + cur + 1, c);
+		len += c;
+		name[len] = '\0';
+		cur += 1 + c;
+	}
+	return -1;
+}
+
+/* Parse the answer section of a raw wire DNS packet for non-IP record types,
+ * filling qr->rdata with a human readable representation of the records. */
+static void _resolve_parse_wire_answers(const unsigned char *data, int data_len, int qtype,
+										struct dns_server_query_result *qr)
+{
+	int pos = 12;
+	char name[DNS_MAX_CNAME_LEN];
+
+	if (data_len < 12) {
+		return;
+	}
+
+	int qdcount = (data[4] << 8) | data[5];
+	int ancount = (data[6] << 8) | data[7];
+
+	/* skip question section */
+	for (int i = 0; i < qdcount && pos < data_len; i++) {
+		if (_resolve_wire_read_name(data, data_len, &pos, name, sizeof(name)) < 0) {
+			return;
+		}
+		pos += 4;
+	}
+
+	for (int i = 0; i < ancount && pos + 10 <= data_len; i++) {
+		if (_resolve_wire_read_name(data, data_len, &pos, name, sizeof(name)) < 0) {
+			return;
+		}
+		if (pos + 10 > data_len) {
+			return;
+		}
+		int rtype = (data[pos] << 8) | data[pos + 1];
+		int ttl = (int)(((unsigned)data[pos + 4] << 24) | ((unsigned)data[pos + 5] << 16) |
+						((unsigned)data[pos + 6] << 8) | (unsigned)data[pos + 7]);
+		int rdlen = (data[pos + 8] << 8) | data[pos + 9];
+		int rdpos = pos + 10;
+		pos = rdpos + rdlen;
+		if (rdpos + rdlen > data_len) {
+			return;
+		}
+
+		if (rtype == qtype) {
+			qr->ttl = (unsigned int)ttl;
+			switch (rtype) {
+			case DNS_T_A:
+			case DNS_T_AAAA:
+				/* handled by the rrs path above */
+				break;
+			case DNS_T_NS:
+			case DNS_T_PTR:
+			case DNS_T_CNAME: {
+				int npos = rdpos;
+				char target[DNS_MAX_CNAME_LEN];
+				if (_resolve_wire_read_name(data, data_len, &npos, target, sizeof(target)) >= 0) {
+					_resolve_append_rdata(qr, target);
+				}
+				break;
+			}
+			case DNS_T_MX: {
+				if (rdlen < 3) {
+					break;
+				}
+				unsigned short preference = ((unsigned short)data[rdpos] << 8) | (unsigned short)data[rdpos + 1];
+				int npos = rdpos + 2;
+				char target[DNS_MAX_CNAME_LEN];
+				if (_resolve_wire_read_name(data, data_len, &npos, target, sizeof(target)) >= 0) {
+					char mx_buf[DNS_MAX_CNAME_LEN * 2];
+					snprintf(mx_buf, sizeof(mx_buf), "%u %s", preference, target);
+					_resolve_append_rdata(qr, mx_buf);
+				}
+				break;
+			}
+			case DNS_T_SRV: {
+				if (rdlen < 7) {
+					break;
+				}
+				unsigned short priority = ((unsigned short)data[rdpos] << 8) | (unsigned short)data[rdpos + 1];
+				unsigned short weight = ((unsigned short)data[rdpos + 2] << 8) | (unsigned short)data[rdpos + 3];
+				unsigned short port = ((unsigned short)data[rdpos + 4] << 8) | (unsigned short)data[rdpos + 5];
+				int npos = rdpos + 6;
+				char target[DNS_MAX_CNAME_LEN];
+				if (_resolve_wire_read_name(data, data_len, &npos, target, sizeof(target)) >= 0) {
+					char srv_buf[DNS_MAX_CNAME_LEN * 2];
+					snprintf(srv_buf, sizeof(srv_buf), "%u %u %u %s", priority, weight, port, target);
+					_resolve_append_rdata(qr, srv_buf);
+				}
+				break;
+			}
+			case DNS_T_TXT: {
+				int tpos = rdpos;
+				char text[DNS_MAX_CNAME_LEN];
+				while (tpos < rdpos + rdlen) {
+					int tlen = data[tpos];
+					tpos++;
+					if (tlen <= 0 || tpos + tlen > rdpos + rdlen) {
+						break;
+					}
+					int copy_len = (tlen < (int)sizeof(text) - 1) ? tlen : (int)sizeof(text) - 1;
+					memcpy(text, data + tpos, copy_len);
+					text[copy_len] = '\0';
+					_resolve_append_rdata(qr, text);
+					tpos += tlen;
+				}
+				break;
+			}
+			case DNS_T_SOA: {
+				int spos = rdpos;
+				char mname[DNS_MAX_CNAME_LEN];
+				char rname[DNS_MAX_CNAME_LEN];
+				if (_resolve_wire_read_name(data, data_len, &spos, mname, sizeof(mname)) < 0) {
+					break;
+				}
+				if (_resolve_wire_read_name(data, data_len, &spos, rname, sizeof(rname)) < 0) {
+					break;
+				}
+				if (spos + 20 > rdpos + rdlen) {
+					break;
+				}
+				char soa_buf[DNS_MAX_CNAME_LEN * 3];
+				snprintf(soa_buf, sizeof(soa_buf), "%s %s", mname, rname);
+				_resolve_append_rdata(qr, soa_buf);
+				break;
+			}
+			case DNS_T_HTTPS: {
+				if (rdlen < 3) {
+					break;
+				}
+				unsigned short priority = ((unsigned short)data[rdpos] << 8) | (unsigned short)data[rdpos + 1];
+				int npos = rdpos + 2;
+				char target[DNS_MAX_CNAME_LEN];
+				if (_resolve_wire_read_name(data, data_len, &npos, target, sizeof(target)) < 0) {
+					break;
+				}
+				/* the root name "." encodes as an empty string */
+				if (target[0] == '\0') {
+					safe_strncpy(target, ".", sizeof(target));
+				}
+				char https_buf[DNS_MAX_QUERY_RESULT_IPS_STR];
+				snprintf(https_buf, sizeof(https_buf), "%u %s", priority, target);
+
+				/* SvcParams: [key(2)][len(2)][value]... */
+				int ppos = npos;
+				int pend = rdpos + rdlen;
+				while (ppos + 4 <= pend) {
+					unsigned short key = ((unsigned short)data[ppos] << 8) | (unsigned short)data[ppos + 1];
+					unsigned short plen = ((unsigned short)data[ppos + 2] << 8) | (unsigned short)data[ppos + 3];
+					ppos += 4;
+					if (ppos + plen > pend) {
+						break;
+					}
+					const unsigned char *pv = data + ppos;
+					switch (key) {
+					case 0: { /* mandatory: list of keys */
+						_resolve_buf_append(https_buf, sizeof(https_buf), " mandatory=");
+						for (int k = 0; k + 2 <= plen; k += 2) {
+							_resolve_buf_append(https_buf, sizeof(https_buf), "%s%u", k > 0 ? "," : "",
+												((unsigned short)pv[k] << 8) | (unsigned short)pv[k + 1]);
+						}
+						break;
+					}
+					case 1: { /* alpn: sequence of length-prefixed protocol names */
+						_resolve_buf_append(https_buf, sizeof(https_buf), " alpn=");
+						for (int k = 0; k < plen;) {
+							int alen = pv[k];
+							if (alen <= 0 || k + 1 + alen > plen) {
+								break;
+							}
+							_resolve_buf_append(https_buf, sizeof(https_buf), "%.*s%s", alen, (const char *)pv + k + 1,
+												k + 1 + alen < plen ? "," : "");
+							k += 1 + alen;
+						}
+						break;
+					}
+					case 2: /* no-default-alpn */
+						_resolve_buf_append(https_buf, sizeof(https_buf), " no-default-alpn");
+						break;
+					case 3: { /* port */
+						unsigned short port = (plen >= 2) ? (((unsigned short)pv[0] << 8) | (unsigned short)pv[1]) : 0;
+						_resolve_buf_append(https_buf, sizeof(https_buf), " port=%u", port);
+						break;
+					}
+					case 4: { /* ipv4hint */
+						_resolve_buf_append(https_buf, sizeof(https_buf), " ipv4hint=");
+						for (int k = 0; k + 4 <= plen; k += 4) {
+							char ip_str[INET_ADDRSTRLEN];
+							inet_ntop(AF_INET, pv + k, ip_str, sizeof(ip_str));
+							_resolve_buf_append(https_buf, sizeof(https_buf), "%s%s", k > 0 ? "," : "", ip_str);
+						}
+						break;
+					}
+					case 5: { /* ech: opaque, show truncated hex */
+						_resolve_buf_append(https_buf, sizeof(https_buf), " ech=");
+						int hex_len = plen < 16 ? plen : 16;
+						for (int k = 0; k < hex_len; k++) {
+							_resolve_buf_append(https_buf, sizeof(https_buf), "%02x", pv[k]);
+						}
+						if (plen > 16) {
+							_resolve_buf_append(https_buf, sizeof(https_buf), "...(%u bytes)", plen);
+						}
+						break;
+					}
+					case 6: { /* ipv6hint */
+						_resolve_buf_append(https_buf, sizeof(https_buf), " ipv6hint=");
+						for (int k = 0; k + 16 <= plen; k += 16) {
+							char ip_str[INET6_ADDRSTRLEN];
+							inet_ntop(AF_INET6, pv + k, ip_str, sizeof(ip_str));
+							_resolve_buf_append(https_buf, sizeof(https_buf), "%s%s", k > 0 ? "," : "", ip_str);
+						}
+						break;
+					}
+					case 7: /* dohpath: URI template string */
+						_resolve_buf_append(https_buf, sizeof(https_buf), " dohpath=%.*s", plen, (const char *)pv);
+						break;
+					default: /* unknown key: show as keyN */
+						_resolve_buf_append(https_buf, sizeof(https_buf), " key%u", key);
+						break;
+					}
+					ppos += plen;
+				}
+				_resolve_append_rdata(qr, https_buf);
+				break;
+			}
+			default:
+				break;
+			}
+		} else if (rtype == DNS_T_CNAME && qr->cname[0] == '\0') {
+			int cpos = rdpos;
+			char target[DNS_MAX_CNAME_LEN];
+			if (_resolve_wire_read_name(data, data_len, &cpos, target, sizeof(target)) >= 0) {
+				safe_strncpy(qr->cname, target, sizeof(qr->cname));
+			}
+		}
+	}
+}
+
+static void _resolve_parse_response(unsigned char *data, int data_len, int qtype, struct dns_server_query_result *qr)
 {
 	unsigned char buf[DNS_IN_PACKSIZE + sizeof(struct dns_packet) + 64];
 	struct dns_packet *packet = (struct dns_packet *)buf;
@@ -1995,10 +2322,20 @@ static void _resolve_parse_response(unsigned char *data, int data_len, struct dn
 		}
 		rrs = dns_get_rrs_next(packet, rrs);
 	}
+
+	/* Other record types (NS/MX/SRV/TXT/SOA/PTR/HTTPS) are stored as opaque
+	 * wire rdata by the smartdns decoder and cannot be read through the rrs
+	 * API. Parse the raw wire packet answer section directly instead. */
+	if (qtype != DNS_T_A && qtype != DNS_T_AAAA) {
+		_resolve_parse_wire_answers(data, data_len, qtype, qr);
+	}
 }
 
-/* Populate chain->query_results[] by querying all UDP servers. */
-static void _resolve_query_servers(const char *domain, struct domain_rule_resolve_chain *chain)
+/* Populate chain->query_results[] by querying UDP servers. When
+ * query_all_servers is non-zero, all servers (including fallback) are
+ * queried in one pass and the result is not written to the cache. */
+static void _resolve_query_servers(const char *domain, struct domain_rule_resolve_chain *chain, int query_all_servers,
+								   int qtype)
 {
 	chain->query_result_num = 0;
 	chain->final_rcode = -1;
@@ -2008,126 +2345,304 @@ static void _resolve_query_servers(const char *domain, struct domain_rule_resolv
 	chain->final_ttl = 0;
 	chain->final_ping_ms = 0;
 
-	for (int i = 0; i < chain->server_num && chain->query_result_num < DNS_MAX_CHECK_SERVERS; i++) {
-		/* Only query UDP servers */
-		if (strncmp(chain->servers[i], "udp://", 6) != 0) {
+	/* Query servers in two phases, consistent with dns_client behavior:
+	 * fallback servers (marked with a trailing '*') are only queried when
+	 * all non-fallback servers fail to answer. */
+	int primary_server_idx[DNS_MAX_CHECK_SERVERS];
+	int primary_server_num = 0;
+	int fallback_server_idx[DNS_MAX_CHECK_SERVERS];
+	int fallback_server_num = 0;
+
+	/* Raw response packets of successful results, used for cache insert */
+	unsigned char *resp_data[DNS_MAX_CHECK_SERVERS] = {0};
+	int resp_len[DNS_MAX_CHECK_SERVERS] = {0};
+
+	for (int i = 0; i < chain->server_num && i < DNS_MAX_CHECK_SERVERS; i++) {
+		if (query_all_servers) {
+			primary_server_idx[primary_server_num++] = i;
 			continue;
 		}
-
-		char ip[DNS_MAX_IPLEN];
-		int port = 53;
-		_parse_server_addr(chain->servers[i], ip, sizeof(ip), &port);
-
-		struct dns_server_query_result *qr = &chain->query_results[chain->query_result_num];
-		safe_strncpy(qr->server, chain->servers[i], sizeof(qr->server));
-
-		unsigned char response[DNS_IN_PACKSIZE];
-		int rlen = _resolve_udp_query(ip, port, domain, DNS_T_A, response, sizeof(response), &qr->ping_ms);
-		if (rlen > 0) {
-			_resolve_parse_response(response, rlen, qr);
+		size_t srv_len = strlen(chain->servers[i]);
+		if (srv_len > 0 && chain->servers[i][srv_len - 1] == '*') {
+			fallback_server_idx[fallback_server_num++] = i;
 		} else {
-			qr->rcode = -1;
+			primary_server_idx[primary_server_num++] = i;
 		}
-		chain->query_result_num++;
+	}
+
+	for (int pass = 0; pass < (query_all_servers ? 1 : 2) && chain->query_result_num < DNS_MAX_CHECK_SERVERS; pass++) {
+		int *server_list = (pass == 0) ? primary_server_idx : fallback_server_idx;
+		int server_list_num = (pass == 0) ? primary_server_num : fallback_server_num;
+
+		for (int j = 0; j < server_list_num && chain->query_result_num < DNS_MAX_CHECK_SERVERS; j++) {
+			int i = server_list[j];
+
+			/* Only query UDP servers */
+			if (strncmp(chain->servers[i], "udp://", 6) != 0) {
+				continue;
+			}
+
+			char ip[DNS_MAX_IPLEN];
+			int port = 53;
+			_parse_server_addr(chain->servers[i], ip, sizeof(ip), &port);
+
+			struct dns_server_query_result *qr = &chain->query_results[chain->query_result_num];
+			safe_strncpy(qr->server, chain->servers[i], sizeof(qr->server));
+
+			unsigned char response[DNS_IN_PACKSIZE];
+			int rlen = _resolve_udp_query(ip, port, domain, qtype, response, sizeof(response), &qr->ping_ms);
+			if (rlen > 0) {
+				_resolve_parse_response(response, rlen, qtype, qr);
+				/* Keep the raw response packet so the winning result can be
+				 * inserted into the shared DNS cache afterwards. */
+				if (qr->rcode == 0 && resp_data[chain->query_result_num] == NULL) {
+					resp_data[chain->query_result_num] = malloc(rlen);
+					if (resp_data[chain->query_result_num] != NULL) {
+						memcpy(resp_data[chain->query_result_num], response, rlen);
+						resp_len[chain->query_result_num] = rlen;
+					}
+				}
+			} else {
+				qr->rcode = -1;
+			}
+			chain->query_result_num++;
+		}
+
+		/* Stop before the fallback pass if any primary server answered */
+		if (pass == 0) {
+			int has_success = 0;
+			for (int i = 0; i < chain->query_result_num; i++) {
+				if (chain->query_results[i].rcode == 0) {
+					has_success = 1;
+					break;
+				}
+			}
+			if (has_success) {
+				break;
+			}
+		}
 	}
 
 	/* Select final result based on response_mode */
-	if (chain->response_mode == DNS_RESPONSE_MODE_FASTEST_RESPONSE ||
-		chain->response_mode == DNS_RESPONSE_MODE_FASTEST_IP) {
-		/* FASTEST_RESPONSE: select server with smallest ping_ms */
-		/* FASTEST_IP: simplified - same as FASTEST_RESPONSE for now */
-		int best_idx = -1;
-		unsigned int best_ping = (unsigned int)-1;
-
-		/* Find server with IPs and smallest ping_ms */
+	int best_idx = -1;
+	if (qtype != DNS_T_A && qtype != DNS_T_AAAA) {
+		/* Non-IP record types: speed check and response_mode do not apply,
+		 * take the first successful answer (empty NOERROR = NODATA). */
 		for (int i = 0; i < chain->query_result_num; i++) {
 			struct dns_server_query_result *qr = &chain->query_results[i];
-			if (qr->rcode == 0 && qr->ip_count > 0 && qr->ping_ms < best_ping) {
-				best_ping = qr->ping_ms;
+			if (qr->rcode == 0 && (qr->rdata[0] != '\0' || qr->cname[0] != '\0')) {
 				best_idx = i;
+				break;
 			}
 		}
-
-		if (best_idx >= 0) {
-			struct dns_server_query_result *qr = &chain->query_results[best_idx];
-			chain->final_rcode = 0;
-			safe_strncpy(chain->final_ips, qr->ips, sizeof(chain->final_ips));
-			safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
-			chain->final_ttl = qr->ttl;
-			chain->final_ping_ms = qr->ping_ms;
-			return;
+		if (best_idx < 0) {
+			/* No records but NOERROR: report the empty answer as NODATA */
+			for (int i = 0; i < chain->query_result_num; i++) {
+				if (chain->query_results[i].rcode == 0) {
+					best_idx = i;
+					break;
+				}
+			}
+		}
+	} else if (chain->response_mode == DNS_RESPONSE_MODE_FASTEST_RESPONSE ||
+			   chain->response_mode == DNS_RESPONSE_MODE_FASTEST_IP) {
+		/* FASTEST_RESPONSE: select server with smallest ping_ms */
+		/* FASTEST_IP: simplified - same as FASTEST_RESPONSE for now */
+		for (int i = 0; i < chain->query_result_num; i++) {
+			struct dns_server_query_result *qr = &chain->query_results[i];
+			if (qr->rcode == 0 && qr->ip_count > 0 &&
+				(best_idx < 0 || qr->ping_ms < chain->query_results[best_idx].ping_ms)) {
+				best_idx = i;
+			}
 		}
 
 		/* No IPs found, try CNAME */
-		best_idx = -1;
-		best_ping = (unsigned int)-1;
-		for (int i = 0; i < chain->query_result_num; i++) {
-			struct dns_server_query_result *qr = &chain->query_results[i];
-			if (qr->rcode == 0 && qr->cname[0] != '\0' && qr->ping_ms < best_ping) {
-				best_ping = qr->ping_ms;
-				best_idx = i;
+		if (best_idx < 0) {
+			for (int i = 0; i < chain->query_result_num; i++) {
+				struct dns_server_query_result *qr = &chain->query_results[i];
+				if (qr->rcode == 0 && qr->cname[0] != '\0' &&
+					(best_idx < 0 || qr->ping_ms < chain->query_results[best_idx].ping_ms)) {
+					best_idx = i;
+				}
 			}
 		}
-
-		if (best_idx >= 0) {
-			struct dns_server_query_result *qr = &chain->query_results[best_idx];
-			chain->final_rcode = 0;
-			safe_strncpy(chain->final_cname, qr->cname, sizeof(chain->final_cname));
-			safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
-			chain->final_ping_ms = qr->ping_ms;
-			return;
+	} else {
+		/* FIRST_PING_IP: prefer first server with IPs, then CNAME */
+		for (int i = 0; i < chain->query_result_num; i++) {
+			struct dns_server_query_result *qr = &chain->query_results[i];
+			if (qr->rcode == 0 && qr->ip_count > 0) {
+				best_idx = i;
+				break;
+			}
 		}
+		if (best_idx < 0) {
+			for (int i = 0; i < chain->query_result_num; i++) {
+				struct dns_server_query_result *qr = &chain->query_results[i];
+				if (qr->rcode == 0 && qr->cname[0] != '\0') {
+					best_idx = i;
+					break;
+				}
+			}
+		}
+	}
 
+	if (best_idx >= 0) {
+		struct dns_server_query_result *qr = &chain->query_results[best_idx];
+		chain->final_rcode = 0;
+		safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
+		chain->final_ping_ms = qr->ping_ms;
+		chain->final_ttl = qr->ttl;
+		if (qr->ip_count > 0) {
+			safe_strncpy(chain->final_ips, qr->ips, sizeof(chain->final_ips));
+		} else {
+			safe_strncpy(chain->final_cname, qr->cname, sizeof(chain->final_cname));
+		}
+		safe_strncpy(chain->final_data, qr->rdata, sizeof(chain->final_data));
+	} else {
 		/* No success, return first error rcode */
 		for (int i = 0; i < chain->query_result_num; i++) {
 			struct dns_server_query_result *qr = &chain->query_results[i];
 			if (qr->rcode != 0 && qr->rcode != -1) {
 				chain->final_rcode = qr->rcode;
 				safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
-				return;
+				break;
 			}
 		}
-	} else {
-		/* FIRST_PING_IP: prefer first server with IPs, then CNAME, then first rcode */
-		for (int i = 0; i < chain->query_result_num; i++) {
-			struct dns_server_query_result *qr = &chain->query_results[i];
-			if (qr->rcode == 0 && qr->ip_count > 0) {
-				chain->final_rcode = 0;
-				safe_strncpy(chain->final_ips, qr->ips, sizeof(chain->final_ips));
-				safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
-				chain->final_ttl = qr->ttl;
-				chain->final_ping_ms = qr->ping_ms;
-				return;
-			}
+	}
+
+	/* Insert the winning answer into the shared DNS cache so that checker
+	 * queries populate the cache like normal requests do. Only A/AAAA/HTTPS
+	 * are cached, same as the dns_server pipeline. The cache module may be
+	 * uninitialized (CLI check mode); dns_cache_insert() handles that safely
+	 * (no-op). Skipped in query_all_servers mode (read-only). */
+	if (!query_all_servers && (qtype == DNS_T_A || qtype == DNS_T_AAAA || qtype == DNS_T_HTTPS) && best_idx >= 0 &&
+		chain->final_rcode == 0 && chain->final_ttl > 0 && resp_data[best_idx] != NULL) {
+		struct dns_cache_key cache_key;
+		memset(&cache_key, 0, sizeof(cache_key));
+		cache_key.domain = domain;
+		cache_key.qtype = qtype;
+		cache_key.dns_group_name = (strcmp(chain->group_name, "default") == 0) ? "" : chain->group_name;
+		cache_key.query_flag = 0;
+
+		/* cache speed is in 0.1ms units, final_ping_ms is in ms */
+		struct dns_cache_data *cache_data = dns_cache_new_data_packet(resp_data[best_idx], resp_len[best_idx]);
+		if (cache_data != NULL) {
+			dns_cache_insert(&cache_key, 0, (int)chain->final_ttl, (int)(chain->final_ping_ms * 10),
+							 (int)chain->final_ttl, cache_data);
 		}
-		for (int i = 0; i < chain->query_result_num; i++) {
-			struct dns_server_query_result *qr = &chain->query_results[i];
-			if (qr->rcode == 0 && qr->cname[0] != '\0') {
-				chain->final_rcode = 0;
-				safe_strncpy(chain->final_cname, qr->cname, sizeof(chain->final_cname));
-				safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
-				chain->final_ping_ms = qr->ping_ms;
-				return;
-			}
+	}
+
+	for (int i = 0; i < DNS_MAX_CHECK_SERVERS; i++) {
+		free(resp_data[i]);
+	}
+}
+
+/* Fill chain cache fields from a cache entry. Decodes the cached DNS packet
+ * to extract IPs and CNAME for display. */
+static void _resolve_fill_cache_info(struct domain_rule_resolve_chain *chain, struct dns_cache *dns_cache)
+{
+	struct dns_server_query_result qr;
+	struct dns_cache_packet *cache_packet = NULL;
+
+	chain->cache_hit = 1;
+	chain->cache_ttl = dns_cache_get_ttl(dns_cache);
+	chain->cache_speed = (int)dns_cache->info.speed;
+	chain->cache_rcode = dns_cache->info.rcode;
+	safe_strncpy(chain->cache_from_group, dns_cache->info.dns_group_name, sizeof(chain->cache_from_group));
+
+	memset(&qr, 0, sizeof(qr));
+	cache_packet = (struct dns_cache_packet *)dns_cache_get_data(dns_cache);
+	if (cache_packet != NULL) {
+		_resolve_parse_response(cache_packet->data, cache_packet->head.size, chain->query_qtype, &qr);
+		dns_cache_data_put((struct dns_cache_data *)cache_packet);
+	}
+
+	safe_strncpy(chain->cache_ips, qr.ips, sizeof(chain->cache_ips));
+	safe_strncpy(chain->cache_cname, qr.cname, sizeof(chain->cache_cname));
+}
+
+/* Look up the DNS cache for the domain (informational only, does not affect
+ * the query path). Cache entries are keyed by group name; default-group
+ * requests are stored with an empty group name, so try both. */
+static void _resolve_check_cache(const char *domain, struct domain_rule_resolve_chain *chain)
+{
+	struct dns_cache_key cache_key;
+	struct dns_cache *dns_cache = NULL;
+	const char *groups[2];
+	int group_num = 0;
+
+	if (chain->action != DOMAIN_ACTION_NAMESERVER && chain->action != DOMAIN_ACTION_NONE) {
+		return;
+	}
+
+	/* Only IP/HTTPS record types are cached, same as the dns_server pipeline. */
+	if (chain->query_qtype != DNS_T_A && chain->query_qtype != DNS_T_AAAA && chain->query_qtype != DNS_T_HTTPS) {
+		return;
+	}
+
+	if (chain->group_name[0] != '\0') {
+		groups[group_num++] = chain->group_name;
+	}
+	groups[group_num++] = "";
+
+	for (int gi = 0; gi < group_num && dns_cache == NULL; gi++) {
+		memset(&cache_key, 0, sizeof(cache_key));
+		cache_key.domain = domain;
+		cache_key.qtype = chain->query_qtype;
+		cache_key.dns_group_name = groups[gi];
+		cache_key.query_flag = 0;
+
+		dns_cache = dns_cache_lookup(&cache_key);
+		if (dns_cache != NULL) {
+			_resolve_fill_cache_info(chain, dns_cache);
 		}
-		for (int i = 0; i < chain->query_result_num; i++) {
-			struct dns_server_query_result *qr = &chain->query_results[i];
-			if (qr->rcode != 0 && qr->rcode != -1) {
-				chain->final_rcode = qr->rcode;
-				safe_strncpy(chain->final_from, qr->server, sizeof(chain->final_from));
-				return;
-			}
-		}
+	}
+
+	if (dns_cache != NULL) {
+		dns_cache_release(dns_cache);
 	}
 }
 
 int dns_conf_resolve_domain(const char *domain, struct domain_rule_resolve_chain *chain)
+{
+	return dns_conf_resolve_domain_ex(domain, chain, 0, 0, DNS_T_A);
+}
+
+int dns_conf_resolve_domain_ex(const char *domain, struct domain_rule_resolve_chain *chain, int clear_cache,
+							   int query_all_servers, int qtype)
 {
 	if (domain == NULL || chain == NULL) {
 		return -1;
 	}
 
 	memset(chain, 0, sizeof(*chain));
+
+	/* Validate the requested record type, fall back to A for unknown values. */
+	switch (qtype) {
+	case DNS_T_A:
+	case DNS_T_AAAA:
+	case DNS_T_CNAME:
+	case DNS_T_NS:
+	case DNS_T_MX:
+	case DNS_T_SRV:
+	case DNS_T_TXT:
+	case DNS_T_SOA:
+	case DNS_T_PTR:
+	case DNS_T_HTTPS:
+		break;
+	default:
+		qtype = DNS_T_A;
+		break;
+	}
+	chain->query_qtype = qtype;
+
+	/* Delete cached entries of this domain (all qtypes/groups) when
+	 * requested, then fall through to a fresh live query. */
+	if (clear_cache) {
+		int removed_count = 0;
+		dns_cache_remove_by_suffix(domain, &removed_count);
+		tlog(TLOG_INFO, "check-domain-rule: cleared %d cache entries for %s", removed_count, domain);
+	}
 
 	/* Phase 1+2: rule matching (reuse existing function) */
 	struct domain_rule_check_result rule_result;
@@ -2148,9 +2663,30 @@ int dns_conf_resolve_domain(const char *domain, struct domain_rule_resolve_chain
 	memcpy(chain->servers, rule_result.servers, sizeof(chain->servers));
 	chain->response_mode = rule_result.response_mode;
 
-	/* Phase 3+4: query servers and select final result (only for NAMESERVER/NONE) */
+	/* FIRST_PING_IP requires ping-based speed check to pick the answer */
+	chain->speed_check_enabled = (chain->response_mode == DNS_RESPONSE_MODE_FIRST_PING_IP);
+
+	/* Phase 3: cache lookup — a valid cached answer is served directly,
+	 * same as dns_server cache behavior, no upstream query is made.
+	 * Cache info is still collected for display when query_all_servers. */
+	_resolve_check_cache(domain, chain);
+
+	if (!query_all_servers && chain->cache_hit && chain->cache_ttl > 0 &&
+		(chain->cache_rcode != 0 || chain->cache_ips[0] != '\0' || chain->cache_cname[0] != '\0')) {
+		chain->final_rcode = chain->cache_rcode;
+		safe_strncpy(chain->final_ips, chain->cache_ips, sizeof(chain->final_ips));
+		safe_strncpy(chain->final_cname, chain->cache_cname, sizeof(chain->final_cname));
+		safe_strncpy(chain->final_from, "cache", sizeof(chain->final_from));
+		chain->final_ttl = (unsigned int)chain->cache_ttl;
+		/* cache_speed is in 0.1ms units and may be negative when the speed
+		 * check failed; final_ping_ms is unsigned, clamp invalid values to 0. */
+		chain->final_ping_ms = (chain->cache_speed > 0) ? (unsigned int)(chain->cache_speed / 10) : 0;
+		return 0;
+	}
+
+	/* Phase 4: query servers and select final result (only for NAMESERVER/NONE) */
 	if (chain->action == DOMAIN_ACTION_NAMESERVER || chain->action == DOMAIN_ACTION_NONE) {
-		_resolve_query_servers(domain, chain);
+		_resolve_query_servers(domain, chain, query_all_servers, qtype);
 	}
 
 	return 0;

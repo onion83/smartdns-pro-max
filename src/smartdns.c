@@ -65,6 +65,40 @@ static int verbose_screen;
 static int exit_status;
 static int exit_restart;
 static char *check_domain_rule_name = NULL;
+static int check_domain_rule_clear_cache = 0;
+static int check_domain_rule_query_all_servers = 0;
+static char *check_domain_record_type = NULL;
+
+/* Map a record type name (A, AAAA, MX, ...) to its DNS type id. Returns 0 for
+ * unknown names. */
+static int _smartdns_parse_record_type(const char *name)
+{
+	if (name == NULL || name[0] == '\0') {
+		return DNS_T_A;
+	}
+	if (strcasecmp(name, "A") == 0) {
+		return DNS_T_A;
+	} else if (strcasecmp(name, "AAAA") == 0) {
+		return DNS_T_AAAA;
+	} else if (strcasecmp(name, "CNAME") == 0) {
+		return DNS_T_CNAME;
+	} else if (strcasecmp(name, "NS") == 0) {
+		return DNS_T_NS;
+	} else if (strcasecmp(name, "MX") == 0) {
+		return DNS_T_MX;
+	} else if (strcasecmp(name, "SRV") == 0) {
+		return DNS_T_SRV;
+	} else if (strcasecmp(name, "TXT") == 0) {
+		return DNS_T_TXT;
+	} else if (strcasecmp(name, "SOA") == 0) {
+		return DNS_T_SOA;
+	} else if (strcasecmp(name, "PTR") == 0) {
+		return DNS_T_PTR;
+	} else if (strcasecmp(name, "HTTPS") == 0) {
+		return DNS_T_HTTPS;
+	}
+	return 0;
+}
 
 static void _help(void)
 {
@@ -89,6 +123,9 @@ static void _help(void)
 		"  --cache-print [file]  print cache.\n"
 		"  --is-quic-supported   is quic http3 supported.\n"
 		"  --check-domain-rule [domain]  check which rule group a domain matches.\n"
+		"  --clear-cache         clear cached entries of the checked domain first, then re-query.\n"
+		"  --query-all-servers   query all servers in the group (including fallback), results are not cached.\n"
+		"  --check-record-type   record type for --check-domain-rule: A AAAA CNAME NS MX SRV TXT SOA PTR HTTPS (default A).\n"
 		""
 
 		"Online help: https://pymumu.github.io/smartdns\n"
@@ -1150,6 +1187,9 @@ static void _print_resolve_chain(const struct domain_rule_resolve_chain *chain)
 			if (chain->final_ips[0] != '\0') {
 				printf("%s (from %s, %ums, TTL=%u)", chain->final_ips, chain->final_from, chain->final_ping_ms,
 					   chain->final_ttl);
+			} else if (chain->final_data[0] != '\0') {
+				printf("%s (from %s, %ums, TTL=%u)", chain->final_data, chain->final_from, chain->final_ping_ms,
+					   chain->final_ttl);
 			} else if (chain->final_cname[0] != '\0') {
 				printf("CNAME -> %s (from %s, %ums)", chain->final_cname, chain->final_from, chain->final_ping_ms);
 			} else if (chain->final_rcode > 0) {
@@ -1170,7 +1210,7 @@ static void _print_resolve_chain(const struct domain_rule_resolve_chain *chain)
  * CLI: check which rule a domain matches, show the full resolution chain.
  * Returns 0 on success (caller should return/exit).
  */
-static int _smartdns_check_domain_rule(const char *domain)
+static int _smartdns_check_domain_rule(const char *domain, int clear_cache, int query_all_servers, int qtype)
 {
 	/* Show loaded geosite data sources */
 	struct geosite_dat *dat = NULL;
@@ -1201,7 +1241,7 @@ static int _smartdns_check_domain_rule(const char *domain)
 
 	/* Build full resolution chain via structured API */
 	struct domain_rule_resolve_chain chain;
-	if (dns_conf_resolve_domain(domain, &chain) != 0) {
+	if (dns_conf_resolve_domain_ex(domain, &chain, clear_cache, query_all_servers, qtype) != 0) {
 		printf("RESULT:\n-------------------------\n%s -> [PASS] -> NONE -> check failed\n-------------------------\n", domain);
 		return -1;
 	}
@@ -1264,6 +1304,9 @@ int smartdns_main(int argc, char *argv[])
 	static struct option long_options[] = {{"cache-print", required_argument, NULL, 256},
 										   {"is-quic-supported", no_argument, NULL, 257},
 										   {"check-domain-rule", required_argument, NULL, 258},
+										   {"clear-cache", no_argument, NULL, 259},
+										   {"query-all-servers", no_argument, NULL, 260},
+										   {"check-record-type", required_argument, NULL, 261},
 										   {"help", no_argument, NULL, 'h'},
 										   {NULL, 0, NULL, 0}};
 
@@ -1340,6 +1383,15 @@ int smartdns_main(int argc, char *argv[])
 		case 258:
 			check_domain_rule_name = optarg;
 			break;
+		case 259:
+			check_domain_rule_clear_cache = 1;
+			break;
+		case 260:
+			check_domain_rule_query_all_servers = 1;
+			break;
+		case 261:
+			check_domain_record_type = optarg;
+			break;
 		default:
 			fprintf(stderr, "unknown option, please run %s -h for help.\n", argv[0]);
 			return 1;
@@ -1389,7 +1441,14 @@ int smartdns_main(int argc, char *argv[])
 
 	/* Check domain rule - exit after check, no need to start server */
 	if (check_domain_rule_name != NULL) {
-		return _smartdns_check_domain_rule(check_domain_rule_name);
+		int check_qtype = _smartdns_parse_record_type(check_domain_record_type);
+		if (check_domain_record_type != NULL && check_qtype == 0) {
+			printf("unknown record type %s, supported: A AAAA CNAME NS MX SRV TXT SOA PTR HTTPS\n",
+				   check_domain_record_type);
+			return 1;
+		}
+		return _smartdns_check_domain_rule(check_domain_rule_name, check_domain_rule_clear_cache,
+										   check_domain_rule_query_all_servers, check_qtype);
 	}
 
 	/* started by systemd, do not restart when crash */

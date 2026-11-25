@@ -626,7 +626,17 @@ int dns_cache_remove_by_suffix(const char *domain_suffix, int *removed_count)
 	int count = 0;
 	size_t slen;
 
+	if (removed_count) {
+		*removed_count = 0;
+	}
+
 	if (domain_suffix == NULL || domain_suffix[0] == '\0') {
+		return 0;
+	}
+
+	/* Cache module may be uninitialized (e.g. --check-domain-rule CLI mode),
+	 * the list/hash tables are not initialized in that case. */
+	if (_dns_cache_is_ready() == 0) {
 		return 0;
 	}
 

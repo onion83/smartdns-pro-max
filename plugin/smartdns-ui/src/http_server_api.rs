@@ -1726,8 +1726,12 @@ impl API {
     }
 
     /// Check domain rule resolution chain <br>
-    /// API: GET /api/config/check-domain-rule?domain=<domain> <br>
-    /// Runs `dns_conf_resolve_domain()` via FFI and returns the full resolution chain as JSON.
+    /// API: GET /api/config/check-domain-rule?domain=&lt;domain&gt;&amp;clear_cache=1&amp;query_all_servers=1 <br>
+    /// Runs `dns_conf_resolve_domain_ex()` via FFI and returns the full resolution chain as JSON.
+    /// When `clear_cache=1`, cached entries of the domain are removed first and a fresh
+    /// upstream query is made.
+    /// When `query_all_servers=1`, all servers (including fallback) are queried and the
+    /// result is not written to the cache.
     async fn api_config_check_domain_rule(
         this: Arc<HttpServer>,
         _param: APIRouteParam,
@@ -1744,8 +1748,35 @@ impl API {
             return API::response_error(StatusCode::BAD_REQUEST, "Domain cannot be empty.");
         }
 
+        let clear_cache = match API::params_get_value::<String>(&params, "clear_cache") {
+            Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            None => false,
+        };
+        let query_all_servers = match API::params_get_value::<String>(&params, "query_all_servers") {
+            Some(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            None => false,
+        };
+
+        // Record type: name (A, AAAA, MX, ...) or numeric type id, default A.
+        let qtype: i32 = match API::params_get_value::<String>(&params, "qtype") {
+            Some(v) => match v.to_uppercase().as_str() {
+                "A" => 1,
+                "NS" => 2,
+                "CNAME" => 5,
+                "SOA" => 6,
+                "PTR" => 12,
+                "MX" => 15,
+                "TXT" => 16,
+                "AAAA" => 28,
+                "SRV" => 33,
+                "HTTPS" => 65,
+                _ => v.parse::<i32>().unwrap_or(1),
+            },
+            None => 1,
+        };
+
         let ret = API::call_blocking(this, move || {
-            smartdns::resolve_domain_chain(&domain)
+            smartdns::resolve_domain_chain(&domain, clear_cache, query_all_servers, qtype)
         })
         .await;
 

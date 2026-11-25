@@ -1092,6 +1092,7 @@ struct DnsServerQueryResult {
     ip_count: i32,
     ttl: u32,
     ping_ms: u32,
+    rdata: [u8; DNS_MAX_QUERY_RESULT_IPS_STR],
 }
 
 #[repr(C)]
@@ -1125,13 +1126,15 @@ struct DomainRuleResolveChain {
     response_mode: i32,
     cache_hit: i32,
     cache_ttl: i32,
-    cache_speed: u32,
+    cache_speed: i32,
     cache_rcode: i32,
     cache_from_group: [u8; DNS_GROUP_NAME_LEN],
     cache_ips: [u8; DNS_MAX_QUERY_RESULT_IPS_STR],
     cache_cname: [u8; DNS_MAX_CNAME_LEN],
     ping_result_num: i32,
     ping_results: [IpPingResult; 8],
+    query_qtype: i32,
+    final_data: [u8; DNS_MAX_QUERY_RESULT_IPS_STR],
 }
 
 extern "C" {
@@ -1139,18 +1142,33 @@ extern "C" {
         domain: *const c_char,
         chain: *mut DomainRuleResolveChain,
     ) -> i32;
+    fn dns_conf_resolve_domain_ex(
+        domain: *const c_char,
+        chain: *mut DomainRuleResolveChain,
+        clear_cache: i32,
+        query_all_servers: i32,
+        qtype: i32,
+    ) -> i32;
 }
 
 /// Resolve a domain through the full rule-matching + DNS query chain.
-/// Calls C `dns_conf_resolve_domain()` via FFI and converts the result to a Rust JSON value.
-pub fn resolve_domain_chain(domain: &str) -> Result<serde_json::Value, String> {
+/// Calls C `dns_conf_resolve_domain_ex()` via FFI and converts the result to a Rust JSON value.
+/// When `clear_cache` is true, cached entries of the domain are removed first
+/// and a fresh upstream query is made.
+/// When `query_all_servers` is true, all servers (including fallback) are
+/// queried and the result is not written to the cache.
+/// `qtype` selects the DNS record type (1=A, 28=AAAA, 15=MX, ...).
+pub fn resolve_domain_chain(domain: &str, clear_cache: bool, query_all_servers: bool, qtype: i32) -> Result<serde_json::Value, String> {
     let domain_cstr = CString::new(domain).map_err(|e| e.to_string())?;
     unsafe {
         let mut chain: DomainRuleResolveChain = std::mem::zeroed();
 
-        let ret = dns_conf_resolve_domain(
+        let ret = dns_conf_resolve_domain_ex(
             domain_cstr.as_ptr(),
             &mut chain,
+            if clear_cache { 1 } else { 0 },
+            if query_all_servers { 1 } else { 0 },
+            qtype,
         );
         if ret != 0 {
             return Err(format!("dns_conf_resolve_domain failed for '{}'", domain));
@@ -1193,6 +1211,7 @@ pub fn resolve_domain_chain(domain: &str) -> Result<serde_json::Value, String> {
                 "cname": cstr(&qr.cname),
                 "ips": cstr(&qr.ips),
                 "ip_count": qr.ip_count,
+                "rdata": cstr(&qr.rdata),
                 "ttl": qr.ttl,
                 "ping_ms": qr.ping_ms,
             }));
@@ -1230,6 +1249,8 @@ pub fn resolve_domain_chain(domain: &str) -> Result<serde_json::Value, String> {
             "final_from": cstr(&chain.final_from),
             "final_ttl": chain.final_ttl,
             "final_ping_ms": chain.final_ping_ms,
+            "query_qtype": chain.query_qtype,
+            "final_data": cstr(&chain.final_data),
             "speed_check_enabled": chain.speed_check_enabled,
             "response_mode": response_mode_str,
             "cache_result": {

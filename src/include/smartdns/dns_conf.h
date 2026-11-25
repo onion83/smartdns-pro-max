@@ -333,10 +333,18 @@ struct dns_server_query_result {
 	int ip_count;                                                /* number of IPs returned */
 	unsigned int ttl;                                            /* TTL of the answer */
 	unsigned int ping_ms;                                        /* round-trip time in ms */
+	char rdata[DNS_MAX_QUERY_RESULT_IPS_STR];                    /* generic rdata text for non-IP record types */
 };
 
 /* Full domain resolution chain: rule matching + actual DNS query results.
  * Populated by dns_conf_resolve_domain(), can be consumed by CLI, plugins, or API. */
+struct ip_ping_result {
+	char ip[DNS_MAX_CNAME_LEN];                    /* IP address that was pinged */
+	int addr_type;                                 /* 4 = IPv4, 6 = IPv6 */
+	int ping_time;                                 /* ping time in 0.1ms units, -1 = timeout */
+	int is_timeout;                                /* non-zero if ping timed out */
+};
+
 struct domain_rule_resolve_chain {
 	/* Phase 1: rule matching */
 	char domain[DNS_MAX_CNAME_LEN];                /* queried domain */
@@ -361,7 +369,25 @@ struct domain_rule_resolve_chain {
 	char final_from[DNS_SERVER_INFO_STR_LEN];     /* which server provided the answer */
 	unsigned int final_ttl;                        /* TTL of the final answer */
 	unsigned int final_ping_ms;                    /* ping time to the answering server */
+	int speed_check_enabled;                       /* non-zero if speed check applies to this domain */
 	enum response_mode_type response_mode;          /* response mode for this domain */
+
+	/* Phase 5: cache state (informational, from dns_cache_lookup) */
+	int cache_hit;                                 /* non-zero if a cache entry was found */
+	int cache_ttl;                                 /* remaining TTL of cached record, seconds */
+	int cache_speed;                               /* cached speed check result, 0.1ms units, <=0 means no valid speed */
+	int cache_rcode;                               /* cached response rcode */
+	char cache_from_group[DNS_GROUP_NAME_LEN];     /* server group the cached record came from */
+	char cache_ips[DNS_MAX_QUERY_RESULT_IPS_STR];  /* comma-separated cached IPs */
+	char cache_cname[DNS_MAX_CNAME_LEN];           /* cached CNAME */
+
+	/* Phase 6: speed check (ping) results */
+	int ping_result_num;                           /* number of ping results */
+	struct ip_ping_result ping_results[8];         /* ping results of final IPs */
+
+	/* Phase 7: record type */
+	int query_qtype;                               /* requested DNS record type (DNS_T_A etc.) */
+	char final_data[DNS_MAX_QUERY_RESULT_IPS_STR]; /* generic rdata text of the final answer for non-IP types */
 };
 
 struct dns_server_groups {

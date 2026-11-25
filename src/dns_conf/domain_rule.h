@@ -54,6 +54,15 @@ void _domain_rule_auto_name_reset(void);
 /* Full resolution: rule match + actual DNS queries. Populates chain struct. */
 int dns_conf_resolve_domain(const char *domain, struct domain_rule_resolve_chain *chain);
 
+/* Same as dns_conf_resolve_domain(), with clear_cache != 0 the cached
+ * entries of the domain are removed first and a fresh query is made.
+ * With query_all_servers != 0 all servers (including fallback) are queried
+ * and the result is not written to the cache.
+ * qtype selects the DNS record type to query (DNS_T_A, DNS_T_AAAA, DNS_T_MX,
+ * DNS_T_CNAME, ...); pass DNS_T_A for the default behavior. */
+int dns_conf_resolve_domain_ex(const char *domain, struct domain_rule_resolve_chain *chain, int clear_cache,
+							   int query_all_servers, int qtype);
+
 #ifdef __cplusplus
 }
 #endif /*__cplusplus */

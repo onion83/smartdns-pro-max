@@ -1,151 +1,152 @@
-# SmartDNS
+# SmartDNS Pro Max
 
-![SmartDNS](doc/smartdns-banner.png)  
-SmartDNS is a local DNS server. SmartDNS accepts DNS query requests from local clients, obtains DNS query results from multiple upstream DNS servers, and returns the fastest access results to clients. supports secure DNS protocols like DoT, DoH, DoQ, DoH3, better protect privacy,  
-Avoiding DNS pollution and improving network access speed, supports high-performance ad filtering.
+**English** | [中文](ReadMe.md)
 
-Unlike dnsmasq's all-servers, smartdns returns the fastest access resolution.
+**An enhanced fork of [pymumu/smartdns](https://github.com/pymumu/smartdns)** — building on the upstream's fast DNS-based traffic splitting, it completes the full geosite domain-list management loop and adds a brand-new rule-chain diagnostic tool.
 
-Support Raspberry Pi, openwrt, ASUS router, Windows and other devices.  
+<p align="center"><img src="doc/smartdns-pro-max-logo-transparent.png" alt="SmartDNS Pro Max" width="480"></p>
 
-## Usage
+SmartDNS is a local DNS server that accepts DNS query requests from local clients, fetches results from multiple upstream DNS servers, and returns the IP with the fastest access speed to the client. It also supports mapping specific domains to fixed IPs for ad filtering, and supports secure DNS protocols such as DoT / DoH / DoQ / DoH3 for better privacy.
 
-Please visit website: [https://pymumu.github.io/smartdns](https://pymumu.github.io/smartdns/en)
+On top of the upstream, this fork adds:
 
-## Software Show
+| Feature | Description |
+| --- | --- |
+| **Geosite domain routing** | Full `geosite-dat` domain-list support: automatic download, change detection, hot reload, WebUI management |
+| **Rule-chain diagnostics** | Original `--check-domain-rule` CLI and WebUI rule inspector — see at a glance which rule a domain hits and which servers it queries |
+| **Online config editing** | Edit main and sub configuration files directly in the WebUI, with multi-file switching |
+| **Stability fixes** | Fixes real crashes: TCP ping use-after-free, fast_ping race condition, geosite reload crash, etc. |
+| **Multi-arch Docker** | Rebuilt build pipeline with amd64 / arm64 runtime images and a dev/debug image |
 
-### Dashboard
+---
 
-![SmartDNS-WebUI](doc/smartdns-webui.png)
+## Highlights
 
-### Speed Comparison
+### 1. Geosite Domain Routing
 
-**Ali DNS**  
-Use Ali DNS to query Baidu's IP and test the results.  
+Introduce domain-list files (local lists or remote URLs) via the `geosite-dat` directive and route traffic by category:
 
-```shell
-pi@raspberrypi:~/code/smartdns_build $ nslookup www.baidu.com 223.5.5.5
-Server:         223.5.5.5
-Address:        223.5.5.5#53
+```conf
+# Sub-config geosite.conf
+geosite-updater 21600 --data-dir /data/apps/smartdns/data --diff-algo crc32 \
+    --http-use-etag yes --http-timeout 10 --http-retry 3 --http-retry-interval 3
 
-Non-authoritative answer:
-www.baidu.com   canonical name = www.a.shifen.com.
-Name:   www.a.shifen.com
-Address: 180.97.33.108
-Name:   www.a.shifen.com
-Address: 180.97.33.107
-
-pi@raspberrypi:~/code/smartdns_build $ ping 180.97.33.107 -c 2
-PING 180.97.33.107 (180.97.33.107) 56(84) bytes of data.
-64 bytes from 180.97.33.107: icmp_seq=1 ttl=55 time=24.3 ms
-64 bytes from 180.97.33.107: icmp_seq=2 ttl=55 time=24.2 ms
-
---- 180.97.33.107 ping statistics ---
-2 packets transmitted, 2 received, 0% packet loss, time 1001ms
-rtt min/avg/max/mdev = 24.275/24.327/24.380/0.164 ms
-pi@raspberrypi:~/code/smartdns_build $ ping 180.97.33.108 -c 2
-PING 180.97.33.108 (180.97.33.108) 56(84) bytes of data.
-64 bytes from 180.97.33.108: icmp_seq=1 ttl=55 time=31.1 ms
-64 bytes from 180.97.33.108: icmp_seq=2 ttl=55 time=31.0 ms
-
---- 180.97.33.108 ping statistics ---
-2 packets transmitted, 2 received, 0% packet loss, time 1001ms
-rtt min/avg/max/mdev = 31.014/31.094/31.175/0.193 ms
+geosite-dat gfw      https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/gfw.list
+geosite-dat netflix  https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/netflix.list
+geosite-dat openai   https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/openai.list
+geosite-dat ads      https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ads-all.list
+geosite-dat apple    https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/apple.list
+geosite-dat site-ctc site-ctc.list
 ```
 
-**smartdns**  
-Use SmartDNS to query Baidu IP and test the results.
+- **Automatic updates**: `geosite-updater` periodically downloads remote lists and detects changes via ETag / mtime / crc32 / md5, skipping reloads when nothing changed
+- **Hot reload**: list changes take effect immediately, no service restart required
+- **Sub-config aware**: geosite directives in the main config and in any `conf-file` sub-configs all take effect
+- **WebUI management**: visually browse each geosite data file — content, line count, and last-update time
+
+![Geosite data viewer](doc/smartdns-pro-max_geosite-data-viewer.png)
+
+Geosite configuration in the main config file editor:
+
+![Geosite configuration](doc/smartdns-pro-max_geosite-command.png)
+
+### 2. Rule-Chain Diagnostics (Rule Inspector)
+
+The most common troubleshooting question — "why did this domain take this route?" — now has a direct answer.
+
+**CLI** (JSON output, script-friendly):
 
 ```shell
-pi@raspberrypi:~/code/smartdns_build $ nslookup www.baidu.com
-Server:         192.168.1.1
-Address:        192.168.1.1#53
-
-Non-authoritative answer:
-www.baidu.com   canonical name = www.a.shifen.com.
-Name:   www.a.shifen.com
-Address: 14.215.177.39
-
-pi@raspberrypi:~/code/smartdns_build $ ping 14.215.177.39 -c 2
-PING 14.215.177.39 (14.215.177.39) 56(84) bytes of data.
-64 bytes from 14.215.177.39: icmp_seq=1 ttl=56 time=6.31 ms
-64 bytes from 14.215.177.39: icmp_seq=2 ttl=56 time=5.95 ms
-
---- 14.215.177.39 ping statistics ---
-2 packets transmitted, 2 received, 0% packet loss, time 1001ms
-rtt min/avg/max/mdev = 5.954/6.133/6.313/0.195 ms
-
+/usr/sbin/smartdns --check-domain-rule www.google.com -c /etc/smartdns/smartdns.conf
 ```
 
-From the comparison, smartdns found the fastest IP address to visit www.baidu.com, so accessing Baidu's DNS is 5 times faster than Ali DNS.
+**WebUI**: enter a domain in "Settings → Rule Inspector" to see the complete rule-matching chain:
 
-## Features
+- Matched rule IDs and actions (NAMESERVER / IPSET / NFTSET, etc.)
+- Cache status (HIT / MISS)
+- Server groups and every upstream server in each group
+- Real query results per server: status code, CNAME chain, returned IP list
+- Results displayed per `response-mode` (FIRST_PING_IP / FASTEST_RESPONSE), with full IPv6 server support
 
-1. **Multiple Virtual DNS server**  
-   Support multiple virtual DNS servers with different ports, rules, and clients.
+![Rule inspector](doc/smartdns-pro-max_rule-inspect.png)
 
-1. **Multiple upstream DNS servers**  
-   Support configuring multiple upstream DNS servers and query at the same time.the query will not be affected, Even if there is a DNS server exception.  
+### 3. Online Config Editing in WebUI
 
-1. **Support per-client query control**  
-   Support controlling clients using different query rules based on MAC and IP addresses, enabling features such as parental control.  
+Beyond the dashboard, query log, and upstream servers, the settings page now includes a config file editor: switch between and edit `smartdns.conf`, `dns-server.conf`, `misc.conf`, and `geosite.conf`, with changes taking effect on save.
 
-1. **Return the fastest IP address**  
-   Support finding the fastest access IP address from the IP address list of the domain name and returning it to the client to avoid DNS pollution and improve network access speed.
+![Online config editing](doc/smartdns-pro-max_geosite-online-editor.png)
 
-1. **Support for multiple query protocols**  
-   Support UDP, TCP, DOT(DNS over TLS), DOH(DNS over HTTPS), DOQ(DNS over Quic), DOH3(DNS over HTTP3) queries and service, and non-53 port queries, effectively avoiding DNS pollution and protect privacy, and support query DNS over socks5, http proxy.
+### 4. Stability Fixes
 
-1. **Domain IP address specification**  
-   Support configuring IP address of specific domain to achieve the effect of advertising filtering, and avoid malicious websites.
+This fork fixes several crashes and race conditions present upstream:
 
-1. **Domain name high performance rule filtering**  
-   Support domain name suffix matching mode, simplify filtering configuration, filter 200,000 recording and take time <1ms.
+- **TCP ping use-after-free**: `speed-check-mode` with `tcp:443` could trigger UAF crashes — fixed, with the default speed-check strategy adjusted
+- **fast_ping race condition**: fixed the race between ping shutdown notification and event draining
+- **geosite reload crash**: config reload could replay a garbled argv due to `getopt_long_only` reordering — fixed with argument-copy protection
+- **HTTP/2 memory safety**: merged and tracked upstream HPACK / HTTP2 stream UAF fixes
 
-1. **Linux/Windows multi-platform support**  
-   Support standard Linux system (Raspberry Pi), openwrt system various firmware, ASUS router native firmware. Support Windows 10 WSL (Windows Subsystem for Linux).
+### 5. Multi-Arch Docker Builds
 
-1. **Support IPV4, IPV6 dual stack**  
-   Support IPV4, IPV6 network, support query A, AAAA record, dual-stack IP selection, and filter IPV6 AAAA record.
+- `amd64` / `arm64` runtime and builder images
+- `smartdns-dev` development/debug image (gdb, strace, vim included)
+- Custom dependencies via `LOCAL_DEPS_PREFIX` (e.g. `/opt`)
+- Static OpenSSL / Curl linking; static release support for the plugin
 
-1. **DNS64**  
-   Support DNS64 translation.
+---
 
-1. **High performance, low resource consumption**  
-   Multi-threaded asynchronous IO mode, cache cache query results.
+## Upstream Core Features
 
-1. **DNS domain forwarding**  
-   Support DNS forwarding, ipset and nftables. Support setting the domain result to ipset and nftset set when speed check fails.
+The following capabilities are inherited from upstream [pymumu/smartdns](https://github.com/pymumu/smartdns):
+
+- **Multiple virtual DNS servers**: independent ports, rules, and clients
+- **Concurrent multi-upstream queries**: no single point of failure
+- **Fastest IP return**: speed-tests resolved IPs and returns the fastest one
+- **Multiple protocols**: UDP / TCP / DoT / DoH / DoQ / DoH3, non-53 ports, socks5 / HTTP proxy
+- **High-performance domain suffix matching**: filtering 200k records in < 1ms
+- **Domain routing**: different domains query different upstreams, with ipset / nftset support (this fork extends to multiple targets per domain)
+- **Per-client control**: parental controls based on MAC / IP
+- **IPv4 / IPv6 dual stack** and **DNS64**
+- **Multi-platform**: Raspberry Pi, OpenWrt, ASUS routers, WSL
 
 ## Architecture
 
-![Architecture](doc/architecture.png)
+<p align="center"><img src="doc/architecture.png" alt="Architecture" width="600"></p>
 
-1. SmartDNS receives DNS query requests from local network devices, such as PCs and mobile phone query requests.
-1. SmartDNS sends query requests to multiple upstream DNS servers, using standard UDP queries, non-standard port UDP queries, and TCP queries.
-1. The upstream DNS server returns a list of Server IP addresses corresponding to the domain name. SmartDNS detects the fastest Server IP with local network access.
-1. Return the fastest accessed Server IP to the local client.
+1. SmartDNS receives DNS query requests from local network devices (PCs, phones);
+2. Queries are sent to multiple upstream DNS servers (with geosite-based routing);
+3. Once upstreams return the IP lists, SmartDNS detects the server IP with the fastest local access speed;
+4. The fastest IP is returned to the local client.
 
-## Compile
+## Build
 
-smartdns contains scripts for compiling packages, supports compiling luci, debian, openwrt, optware installation packages, and can execute `package/build-pkg.sh` compilation.
+**Local build**:
 
-## [Donate](#donate)  
+```shell
+make
+```
 
-If you feel that this project is helpful to you, please donate to us so that the project can continue to develop and be more perfect.
+**Docker build** (recommended, multi-arch):
 
-### PayPal
+```shell
+# amd64
+docker build -t smartdns:amd64 .
 
-[![Support via PayPal](https://cdn.rawgit.com/twolfson/paypal-github-button/1.0.0/dist/button.svg)](https://paypal.me/PengNick/)
+# arm64
+docker build -f Dockerfile.arm64 -t smartdns:arm64 .
+```
 
-### Alipay
+SmartDNS also provides packaging scripts (`package/build-pkg.sh`) for LuCI, Debian, OpenWrt, and Optware packages.
 
-![alipay](doc/alipay_donate.jpg)
+**WebUI**: the companion WebUI frontend lives in the separate repo [onion83/smartdns-webui](https://github.com/onion83/smartdns-webui); the in-plugin source is under [smartdns-ui plugin](plugin/smartdns-ui/), built with Next.js (`npm run build`).
 
-### Wechat
-  
-![wechat](doc/wechat_donate.jpg)
+## Upstream Documentation
 
-## Open Source License
+For full configuration documentation, see the upstream site: [https://pymumu.github.io/smartdns](https://pymumu.github.io/smartdns)
 
-Smartdns is licensed to the public under the GPL V3 License.
+## Acknowledgements
+
+This project is based on upstream [pymumu/smartdns](https://github.com/pymumu/smartdns). Thanks to the original author [@nickpeng](https://github.com/pymumu) and all upstream contributors.
+
+## License
+
+SmartDNS is open source under the GPL V3 license.

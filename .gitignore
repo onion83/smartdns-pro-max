@@ -3,44 +3,24 @@
 *.a
 *.pem
 .DS_Store
-*.swp
-*.swx
+*.swp.
+*.a
 systemd/smartdns.service
 test.bin
 package/target
 package/*.gz
 package/*.ipk
 target
-data/
+_nouse/
 third_party/
-smartdns-geosite.conf
-.github
-_nouse
 
-# Temporary and test files
-*.tar
-*.tgz
-*.poc
+# Local dev data and backups
+data/
 *.bak
-test_*
-monitor-*.sh
-start-*.sh
-Dockerfile.*
-?.workbuddy/
-wwwroot/
-*.png
-*.so
-smartdns-test-*.conf
-sub-config-*.conf
-
-# Build artifacts
-third_party/openssl/
-smartdns
-smartdns_ui.so.workbuddy/
 
 # Release build files and scripts
 build-static.sh
-smartdns-*
+/smartdns-*
 *.ipk
 *.apk
 *.deb

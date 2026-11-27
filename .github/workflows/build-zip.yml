@@ -161,6 +161,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # gh shells out to git; inside the musl container git refuses
+          # the checkout over ownership, so mark it safe first.
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}" || true
           gh release view nightly >/dev/null 2>&1 || \
             gh release create nightly --prerelease \
               --title "Nightly builds" \

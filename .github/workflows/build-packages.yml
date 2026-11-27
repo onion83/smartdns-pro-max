@@ -132,8 +132,11 @@ jobs:
           apk add --no-cache \
             build-base linux-headers musl-dev zlib-dev zlib-static \
             zstd-dev zstd-static brotli-dev brotli-static \
-            pkgconf git ca-certificates perl wget bash tzdata \
+            pkgconf git ca-certificates perl wget bash tzdata tar \
             llvm-dev clang clang-dev file github-cli
+          # GNU tar (shadowing busybox tar) is required by
+          # actions/cache inside Alpine containers; with busybox tar
+          # its save step fails and the cache never persists.
 
       - name: Install Rust
         if: matrix.kind == 'glibc'

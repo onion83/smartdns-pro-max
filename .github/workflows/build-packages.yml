@@ -253,7 +253,12 @@ jobs:
           echo "PKG_PLAIN_BASE=${PKG_PLAIN%.gz}" >> "$GITHUB_ENV"
           echo "PKG_UI_BASE=${PKG_UI%.gz}" >> "$GITHUB_ENV"
           export PKG_PLAIN PKG_UI
-          mkdir -p "$HOME/.cargo/bin"
+          # Stage the host-cached bindgen (actions/cache path) into the
+          # workspace so the container can reuse it; the container uses
+          # its OWN CARGO_HOME/RUSTUP_HOME inside the workspace, never
+          # the host's ~/.cargo (glibc binaries would leak in).
+          mkdir -p .bindgen-cache
+          cp "$HOME/.cargo/bin/bindgen" .bindgen-cache/bindgen 2>/dev/null || true
           cat > inside-build.sh <<'EOS'
           apk add --no-cache \
             build-base linux-headers musl-dev zlib-dev zlib-static \
@@ -261,12 +266,16 @@ jobs:
             pkgconf git ca-certificates perl wget curl bash tzdata \
             llvm-dev clang clang-dev file
           git config --global --add safe.directory /work
-          export PATH="$HOME/.cargo/bin:$PATH"
-          if [ ! -x "$HOME/.cargo/bin/rustc" ]; then
-            wget -qO- https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          fi
-          if [ ! -x "$HOME/.cargo/bin/bindgen" ]; then
+          export RUSTUP_HOME=/work/.rustup-home CARGO_HOME=/work/.cargo-home
+          export PATH="$CARGO_HOME/bin:$PATH"
+          curl -sSfL https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal
+          command -v cargo
+          if [ -x /work/.bindgen-cache/bindgen ]; then
+            cp /work/.bindgen-cache/bindgen "$CARGO_HOME/bin/bindgen"
+          else
             cargo install --force --locked bindgen-cli
+            cp "$CARGO_HOME/bin/bindgen" /work/.bindgen-cache/bindgen
           fi
           export LOCAL_DEPS_PREFIX=/opt
           env LOCAL_OPENSSL_INSTALL=/opt/openssl \
@@ -303,9 +312,12 @@ jobs:
           EOS
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:/work" -w /work \
-            -v "${HOME}/.cargo:/root/.cargo" \
             -e PKG_PLAIN -e PKG_UI \
             alpine:3.24 sh -e /work/inside-build.sh
+          # Hand a container-built bindgen back to the host cache path
+          # so the actions/cache post-step can save it for next time.
+          mkdir -p "$HOME/.cargo/bin"
+          cp .bindgen-cache/bindgen "$HOME/.cargo/bin/bindgen" 2>/dev/null || true
 
       - name: Upload plain tarball as artifact
         uses: actions/upload-artifact@v6

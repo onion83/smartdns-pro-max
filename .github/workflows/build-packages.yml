@@ -1,0 +1,249 @@
+# Build smartdns for three Linux variants and pack each variant into
+# two gzip tarballs (plain and with-UI):
+#
+#   smartdns-linux-<arch>-<libc>-<YYYYMMDD>.gz      (no UI)
+#   smartdns-ui-linux-<arch>-<libc>-<YYYYMMDD>.gz   (with UI)
+#
+#   <arch>: amd64 / arm64, <libc>: glibc / musl, date in Asia/Shanghai.
+#
+# Layout inside every tarball (top folder "smartdns/"):
+#   plain: smartdns/smartdns
+#   ui:    smartdns/smartdns, smartdns/smartdns_ui.so, smartdns/www/
+#
+# The www frontend is platform-independent, so it is built ONCE in the
+# "www" job from the separate onion83/smartdns-webui project (Next.js
+# static export) and copied into every platform's UI package.
+#
+# Manual trigger only (Actions -> "Build packages" -> Run workflow).
+# Pick the branch to build when dispatching. The tarballs are attached
+# to the "nightly" GitHub Release (same place release.yml uploads to).
+#
+# All platform jobs prefer the repo's own third-party dependencies:
+# OpenSSL 4.1.0 and curl 8.23.0 are built into /opt by the repo's
+# third_party scripts and picked up via LOCAL_DEPS_PREFIX=/opt, which
+# outranks the system libraries in src/Makefile detection (system is
+# only the fallback). The /opt copies are built static-only (no .so
+# files at all) and linking is the Makefile's STATIC_DEPS mode, so
+# OpenSSL, libcurl, zlib and libcurl's own compression tail (zstd,
+# brotli) are all compiled in and the binary runs on a bare system.
+# libc/libgcc_s deliberately stay dynamic: the Makefile's full-static
+# mode (-static) is incompatible with loading the smartdns_ui.so
+# plugin via dlopen. The plugin itself is built fully self-contained
+# (musl target, gcc_s replaced by static libgcc via the repo's
+# ld-static-gcc.sh wrapper).
+# The compression dev packages are installed BEFORE building curl
+# (the same approach as the repo's Dockerfile.builder-base) so curl
+# picks the features up and their archives exist at link time.
+# glibc jobs run natively on GitHub runners (x86_64 and ARM64); the
+# musl job runs inside Alpine, mirroring Dockerfile.builder-base-amd64.
+
+name: Build packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  www:
+    name: www (smartdns-webui, built once)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout smartdns-webui
+        uses: actions/checkout@v5
+        with:
+          repository: onion83/smartdns-webui
+          path: smartdns-webui
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Build www (Next.js static export)
+        working-directory: smartdns-webui
+        run: |
+          npm ci
+          npm run build
+          test -f out/index.html
+          du -sh out
+
+      - name: Upload www artifact (reused by all platforms)
+        uses: actions/upload-artifact@v6
+        with:
+          name: www
+          path: smartdns-webui/out
+          if-no-files-found: error
+
+  build:
+    name: ${{ matrix.label }}
+    needs: www
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64-glibc
+            runner: ubuntu-24.04
+            container: ~
+            kind: glibc
+            arch: amd64
+            libc: glibc
+          - label: linux-aarch64-glibc
+            runner: ubuntu-24.04-arm
+            container: ~
+            kind: glibc
+            arch: arm64
+            libc: glibc
+          - label: linux-x86_64-musl
+            runner: ubuntu-24.04
+            container: alpine:3.24
+            kind: musl
+            arch: amd64
+            libc: musl
+
+    steps:
+      - name: Install tools (glibc runners)
+        if: matrix.kind == 'glibc'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config git perl wget ca-certificates \
+            zlib1g-dev libzstd-dev libbrotli-dev clang libclang-dev file
+          # zlib1g-dev/libzstd-dev/libbrotli-dev ship the static archives
+          # that the /opt libcurl.a needs at link time; the workflow
+          # links them with -Bstatic, so no runtime copies are needed.
+
+      - name: Install tools (musl, Alpine)
+        if: matrix.kind == 'musl'
+        run: |
+          apk add --no-cache \
+            build-base linux-headers musl-dev zlib-dev zlib-static \
+            zstd-dev zstd-static brotli-dev brotli-static \
+            pkgconf git ca-certificates perl wget bash tzdata \
+            llvm-dev clang clang-dev file github-cli
+
+      - name: Install Rust
+        if: matrix.kind == 'glibc'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust (musl, Alpine)
+        if: matrix.kind == 'musl'
+        shell: bash
+        run: |
+          wget -qO- https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Cache bindgen
+        id: cache-bindgen
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/bindgen
+          key: ${{ matrix.label }}-bindgen-v1
+
+      - name: Install bindgen
+        if: steps.cache-bindgen.outputs.cache-hit != 'true'
+        shell: bash
+        run: cargo install --force --locked bindgen-cli
+
+      - name: Download www (built once in the www job)
+        uses: actions/download-artifact@v7
+        with:
+          name: www
+          path: www-out
+
+      - name: Build custom dependencies into /opt (OpenSSL 4.1.0, curl 8.23.0)
+        shell: bash
+        run: |
+          if [ "${{ matrix.kind }}" = "glibc" ]; then SUDO=sudo; else SUDO=; fi
+          # Static ONLY: with no .so files in /opt at all, nothing can
+          # pick a shared OpenSSL/curl up at build or runtime, and the
+          # resulting binary needs no OpenSSL/CURL shared libraries.
+          $SUDO env LOCAL_OPENSSL_INSTALL=/opt/openssl \
+            sh third_party/build_openssl.sh 4.1.0 static
+          $SUDO env LIBS="-ldl -lpthread -lz" LOCAL_CURL_INSTALL=/opt/curl \
+            LOCAL_OPENSSL_INSTALL=/opt/openssl \
+            sh third_party/build_curl.sh 8.23.0 static
+
+      - name: Build and pack (plain + ui tarballs)
+        shell: bash
+        run: |
+          export LOCAL_DEPS_PREFIX=/opt
+          DATE="$(TZ=Asia/Shanghai date +%Y%m%d)"
+          PKG_PLAIN="smartdns-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.gz"
+          PKG_UI="smartdns-ui-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.gz"
+          echo "PKG_PLAIN=${PKG_PLAIN}" >> "$GITHUB_ENV"
+          echo "PKG_UI=${PKG_UI}" >> "$GITHUB_ENV"
+          echo "PKG_PLAIN_BASE=${PKG_PLAIN%.gz}" >> "$GITHUB_ENV"
+          echo "PKG_UI_BASE=${PKG_UI%.gz}" >> "$GITHUB_ENV"
+          test -f www-out/index.html
+          check_needed() {
+            # The /opt dependencies are static-only builds, so the
+            # binary must not NEED any ssl/crypto/curl/z/compression
+            # shared lib; only libc/libgcc_s/libm may stay dynamic
+            # (dlopen plugins). Check readelf's NEEDED list, not ldd
+            # (which also shows transitive entries).
+            if readelf -d "$1" | grep -E "NEEDED.*(libssl|libcrypto|libcurl|libz\.|libzstd|libbrotli)"; then
+              echo "ERROR: binary still depends on a dynamic ssl/curl/z library" >&2
+              exit 1
+            fi
+          }
+          # ---- plain: no UI plugin, no www ----
+          make clean || true
+          make WITH_UI=0 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
+          file src/smartdns
+          ldd src/smartdns || true
+          check_needed src/smartdns
+          mkdir -p stage-plain/smartdns
+          cp src/smartdns stage-plain/smartdns/
+          (cd stage-plain && tar -cf - smartdns | gzip -9 > "../${PKG_PLAIN}")
+          # ---- ui: plugin + www (www copied from the www job) ----
+          make clean || true
+          make WITH_UI=1 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
+          file src/smartdns plugin/smartdns-ui/target/smartdns_ui.so
+          ldd src/smartdns || true
+          check_needed src/smartdns
+          mkdir -p stage-ui/smartdns/www
+          cp src/smartdns plugin/smartdns-ui/target/smartdns_ui.so stage-ui/smartdns/
+          cp -r www-out/. stage-ui/smartdns/www/
+          test -f stage-ui/smartdns/www/index.html
+          (cd stage-ui && tar -cf - smartdns | gzip -9 > "../${PKG_UI}")
+          echo "== ${PKG_PLAIN} =="
+          tar -tzf "${PKG_PLAIN}"
+          echo "== ${PKG_UI} (first entries) =="
+          tar -tzf "${PKG_UI}" | head -20
+
+      - name: Upload plain tarball as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.PKG_PLAIN_BASE }}
+          path: ${{ env.PKG_PLAIN }}
+          if-no-files-found: error
+
+      - name: Upload ui tarball as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.PKG_UI_BASE }}
+          path: ${{ env.PKG_UI }}
+          if-no-files-found: error
+
+      - name: Attach tarballs to nightly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # gh shells out to git; inside the musl container git refuses
+          # the checkout over ownership, so mark it safe first.
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}" || true
+          gh release view nightly >/dev/null 2>&1 || \
+            gh release create nightly --prerelease \
+              --title "Nightly builds" \
+              --notes "Automated nightly and manual builds."
+          gh release upload nightly "${PKG_PLAIN}" "${PKG_UI}" --clobber

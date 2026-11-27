@@ -169,19 +169,54 @@ jobs:
           name: www
           path: www-out
 
+      - name: Cache /opt dependencies
+        uses: actions/cache@v5
+        with:
+          path: deps-cache
+          # Content-addressed key: platform label + dependency
+          # versions + hash of the two scripts that produce the
+          # content. Exact match only, deliberately NO restore-keys:
+          # a prefix "near match" would silently restore libraries
+          # built from different inputs. Entries are immutable once
+          # saved; if one ever went bad, bump the -vN suffix to
+          # orphan it and start a fresh lineage.
+          key: deps-${{ matrix.label }}-ssl4.1.0-curl8.23.0-${{ hashFiles('third_party/build_openssl.sh', 'third_party/build_curl.sh') }}-v1
+
       - name: Build custom dependencies into /opt (OpenSSL 4.1.0, curl 8.23.0)
         if: matrix.kind != 'musl-docker'
         shell: bash
         run: |
           if [ "${{ matrix.kind }}" = "glibc" ]; then SUDO=sudo; else SUDO=; fi
-          # Static ONLY: with no .so files in /opt at all, nothing can
-          # pick a shared OpenSSL/curl up at build or runtime, and the
-          # resulting binary needs no OpenSSL/CURL shared libraries.
-          $SUDO env LOCAL_OPENSSL_INSTALL=/opt/openssl \
-            sh third_party/build_openssl.sh 4.1.0 static
-          $SUDO env LIBS="-ldl -lpthread -lz" LOCAL_CURL_INSTALL=/opt/curl \
-            LOCAL_OPENSSL_INSTALL=/opt/openssl \
-            sh third_party/build_curl.sh 8.23.0 static
+          restored=0
+          if [ -f deps-cache/deps.tar ] && [ -f deps-cache/deps.tar.sha256 ]; then
+            # Verify before trusting the cache: payload checksum, the
+            # two static archives present, and no shared libssl /
+            # libcrypto / libcurl inside (static-only invariant).
+            if (cd deps-cache && sha256sum -c deps.tar.sha256 >/dev/null) \
+               && tar -tf deps-cache/deps.tar | grep -qE 'opt/openssl/lib(64)?/libssl\.a' \
+               && tar -tf deps-cache/deps.tar | grep -qE 'opt/curl/lib(64)?/libcurl\.a' \
+               && ! tar -tf deps-cache/deps.tar | grep -qE 'lib(ssl|crypto|curl)\.so'; then
+              $SUDO tar -xf deps-cache/deps.tar -C /
+              restored=1
+              echo "deps: restored from verified cache"
+            else
+              echo "deps: cache failed verification, rebuilding"
+            fi
+          fi
+          if [ "$restored" = "0" ]; then
+            # Static ONLY: with no .so files in /opt at all, nothing
+            # can pick a shared OpenSSL/curl up at build or runtime,
+            # and the resulting binary needs no OpenSSL/CURL shared
+            # libraries.
+            $SUDO env LOCAL_OPENSSL_INSTALL=/opt/openssl \
+              sh third_party/build_openssl.sh 4.1.0 static
+            $SUDO env LIBS="-ldl -lpthread -lz" LOCAL_CURL_INSTALL=/opt/curl \
+              LOCAL_OPENSSL_INSTALL=/opt/openssl \
+              sh third_party/build_curl.sh 8.23.0 static
+            mkdir -p deps-cache
+            $SUDO tar -cf deps-cache/deps.tar -C / opt/openssl opt/curl
+            (cd deps-cache && sha256sum deps.tar > deps.tar.sha256)
+          fi
 
       - name: Build and pack (plain + ui tarballs)
         if: matrix.kind != 'musl-docker'
@@ -278,11 +313,29 @@ jobs:
             cp "$CARGO_HOME/bin/bindgen" /work/.bindgen-cache/bindgen
           fi
           export LOCAL_DEPS_PREFIX=/opt
-          env LOCAL_OPENSSL_INSTALL=/opt/openssl \
-            sh third_party/build_openssl.sh 4.1.0 static
-          env LIBS="-ldl -lpthread -lz" LOCAL_CURL_INSTALL=/opt/curl \
-            LOCAL_OPENSSL_INSTALL=/opt/openssl \
-            sh third_party/build_curl.sh 8.23.0 static
+          restored=0
+          if [ -f deps-cache/deps.tar ] && [ -f deps-cache/deps.tar.sha256 ]; then
+            if (cd deps-cache && sha256sum -c deps.tar.sha256 >/dev/null) \
+               && tar -tf deps-cache/deps.tar | grep -qE 'opt/openssl/lib(64)?/libssl\.a' \
+               && tar -tf deps-cache/deps.tar | grep -qE 'opt/curl/lib(64)?/libcurl\.a' \
+               && ! tar -tf deps-cache/deps.tar | grep -qE 'lib(ssl|crypto|curl)\.so'; then
+              tar -xf deps-cache/deps.tar -C /
+              restored=1
+              echo "deps: restored from verified cache"
+            else
+              echo "deps: cache failed verification, rebuilding"
+            fi
+          fi
+          if [ "$restored" = "0" ]; then
+            env LOCAL_OPENSSL_INSTALL=/opt/openssl \
+              sh third_party/build_openssl.sh 4.1.0 static
+            env LIBS="-ldl -lpthread -lz" LOCAL_CURL_INSTALL=/opt/curl \
+              LOCAL_OPENSSL_INSTALL=/opt/openssl \
+              sh third_party/build_curl.sh 8.23.0 static
+            mkdir -p deps-cache
+            tar -cf deps-cache/deps.tar -C / opt/openssl opt/curl
+            (cd deps-cache && sha256sum deps.tar > deps.tar.sha256)
+          fi
           check_needed() {
             if readelf -d "$1" | grep -E "NEEDED.*(libssl|libcrypto|libcurl|libz\.|libzstd|libbrotli)"; then
               echo "ERROR: binary still depends on a dynamic ssl/curl/z library" >&2

@@ -174,6 +174,16 @@ jobs:
           name: www
           path: www-out
 
+      - name: Cache third-party sources
+        uses: actions/cache@v5
+        with:
+          path: src-cache
+          # Pristine extracted upstream sources: platform-neutral, so
+          # one entry serves all platforms. The tarballs' bytes are
+          # pinned by official SHA256 sums checked in the deps step,
+          # so the key only carries the versions and an epoch suffix.
+          key: src-ssl4.1.0-curl8.23.0-v1
+
       - name: Cache /opt dependencies
         uses: actions/cache@v5
         with:
@@ -185,7 +195,7 @@ jobs:
           # built from different inputs. Entries are immutable once
           # saved; if one ever went bad, bump the -vN suffix to
           # orphan it and start a fresh lineage.
-          key: deps-${{ matrix.label }}-ssl4.1.0-curl8.23.0-${{ hashFiles('third_party/build_openssl.sh', 'third_party/build_curl.sh') }}-v1
+          key: deps-${{ matrix.label }}-ssl4.1.0-curl8.23.0-${{ hashFiles('third_party/build_openssl.sh', 'third_party/build_curl.sh') }}-v2
 
       - name: Build custom dependencies into /opt (OpenSSL 4.1.0, curl 8.23.0)
         if: matrix.kind != 'musl-docker'
@@ -217,6 +227,29 @@ jobs:
             # can pick a shared OpenSSL/curl up at build or runtime,
             # and the resulting binary needs no OpenSSL/CURL shared
             # libraries.
+            # Prepare pristine third-party sources. src-cache holds
+            # the hash-verified tarballs + extracted trees and is
+            # never built in (the build scripts dirty their source
+            # dir); on a source-cache miss, download, verify against
+            # the pinned official SHA256 sums, and extract here.
+            # The trees are then copied into the scripts' own
+            # download dirs, so the scripts skip both the download
+            # and the extraction (consuming jobs need no xz at all:
+            # sources arrive already extracted).
+            if [ ! -f src-cache/openssl-4.1.0/Configure ] || [ ! -f src-cache/curl-8.23.0/configure ]; then
+              mkdir -p src-cache
+              wget -q https://www.openssl.org/source/openssl-4.1.0.tar.gz -O src-cache/openssl-4.1.0.tar.gz
+              wget -q https://curl.se/download/curl-8.23.0.tar.xz -O src-cache/curl-8.23.0.tar.xz
+              (cd src-cache && printf '%s  %s\n%s  %s\n' \
+                50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd openssl-4.1.0.tar.gz \
+                8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5 curl-8.23.0.tar.xz \
+                | sha256sum -c -)
+              tar -xzf src-cache/openssl-4.1.0.tar.gz -C src-cache
+              tar -xf src-cache/curl-8.23.0.tar.xz -C src-cache
+            fi
+            mkdir -p third_party/openssl third_party/curl
+            cp -a src-cache/openssl-4.1.0.tar.gz src-cache/openssl-4.1.0 third_party/openssl/
+            cp -a src-cache/curl-8.23.0.tar.xz src-cache/curl-8.23.0 third_party/curl/
             $SUDO env LOCAL_OPENSSL_INSTALL=/opt/openssl \
               sh third_party/build_openssl.sh 4.1.0 static
             $SUDO env LIBS="-ldl -lpthread -lz" LOCAL_CURL_INSTALL=/opt/curl \
@@ -339,6 +372,29 @@ jobs:
             fi
           fi
           if [ "$restored" = "0" ]; then
+            # Prepare pristine third-party sources. src-cache holds
+            # the hash-verified tarballs + extracted trees and is
+            # never built in (the build scripts dirty their source
+            # dir); on a source-cache miss, download, verify against
+            # the pinned official SHA256 sums, and extract here.
+            # The trees are then copied into the scripts' own
+            # download dirs, so the scripts skip both the download
+            # and the extraction (consuming jobs need no xz at all:
+            # sources arrive already extracted).
+            if [ ! -f src-cache/openssl-4.1.0/Configure ] || [ ! -f src-cache/curl-8.23.0/configure ]; then
+              mkdir -p src-cache
+              wget -q https://www.openssl.org/source/openssl-4.1.0.tar.gz -O src-cache/openssl-4.1.0.tar.gz
+              wget -q https://curl.se/download/curl-8.23.0.tar.xz -O src-cache/curl-8.23.0.tar.xz
+              (cd src-cache && printf '%s  %s\n%s  %s\n' \
+                50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd openssl-4.1.0.tar.gz \
+                8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5 curl-8.23.0.tar.xz \
+                | sha256sum -c -)
+              tar -xzf src-cache/openssl-4.1.0.tar.gz -C src-cache
+              tar -xf src-cache/curl-8.23.0.tar.xz -C src-cache
+            fi
+            mkdir -p third_party/openssl third_party/curl
+            cp -a src-cache/openssl-4.1.0.tar.gz src-cache/openssl-4.1.0 third_party/openssl/
+            cp -a src-cache/curl-8.23.0.tar.xz src-cache/curl-8.23.0 third_party/curl/
             env LOCAL_OPENSSL_INSTALL=/opt/openssl \
               sh third_party/build_openssl.sh 4.1.0 static
             env LIBS="-ldl -lpthread -lz" LOCAL_CURL_INSTALL=/opt/curl \

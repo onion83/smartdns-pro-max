@@ -197,15 +197,19 @@ jobs:
             # Verify before trusting the cache: payload checksum, the
             # two static archives present, and no shared libssl /
             # libcrypto / libcurl inside (static-only invariant).
-            if (cd deps-cache && sha256sum -c deps.tar.sha256 >/dev/null) \
-               && tar -tf deps-cache/deps.tar | grep -qE 'opt/openssl/lib(64)?/libssl\.a' \
-               && tar -tf deps-cache/deps.tar | grep -qE 'opt/curl/lib(64)?/libcurl\.a' \
-               && ! tar -tf deps-cache/deps.tar | grep -qE 'lib(ssl|crypto|curl)\.so'; then
+            # Each check is named so the log shows which one failed.
+            fail=""
+            (cd deps-cache && sha256sum -c deps.tar.sha256 >/dev/null) || fail="sha256"
+            listing="$(tar -tf deps-cache/deps.tar)"
+            [ -n "$fail" ] || printf '%s' "$listing" | grep -qE 'opt/openssl/lib(64)?/libssl\.a' || fail="libssl.a-missing"
+            [ -n "$fail" ] || printf '%s' "$listing" | grep -qE 'opt/curl/lib(64)?/libcurl\.a' || fail="libcurl.a-missing"
+            if [ -z "$fail" ] && printf '%s' "$listing" | grep -qE 'lib(ssl|crypto|curl)\.so'; then fail="shared-lib-present"; fi
+            if [ -z "$fail" ]; then
               $SUDO tar -xf deps-cache/deps.tar -C /
               restored=1
               echo "deps: restored from verified cache"
             else
-              echo "deps: cache failed verification, rebuilding"
+              echo "deps: cache failed verification ($fail), rebuilding"
             fi
           fi
           if [ "$restored" = "0" ]; then
@@ -320,15 +324,18 @@ jobs:
           export LOCAL_DEPS_PREFIX=/opt
           restored=0
           if [ -f deps-cache/deps.tar ] && [ -f deps-cache/deps.tar.sha256 ]; then
-            if (cd deps-cache && sha256sum -c deps.tar.sha256 >/dev/null) \
-               && tar -tf deps-cache/deps.tar | grep -qE 'opt/openssl/lib(64)?/libssl\.a' \
-               && tar -tf deps-cache/deps.tar | grep -qE 'opt/curl/lib(64)?/libcurl\.a' \
-               && ! tar -tf deps-cache/deps.tar | grep -qE 'lib(ssl|crypto|curl)\.so'; then
+            fail=""
+            (cd deps-cache && sha256sum -c deps.tar.sha256 >/dev/null) || fail="sha256"
+            listing="$(tar -tf deps-cache/deps.tar)"
+            [ -n "$fail" ] || printf '%s' "$listing" | grep -qE 'opt/openssl/lib(64)?/libssl\.a' || fail="libssl.a-missing"
+            [ -n "$fail" ] || printf '%s' "$listing" | grep -qE 'opt/curl/lib(64)?/libcurl\.a' || fail="libcurl.a-missing"
+            if [ -z "$fail" ] && printf '%s' "$listing" | grep -qE 'lib(ssl|crypto|curl)\.so'; then fail="shared-lib-present"; fi
+            if [ -z "$fail" ]; then
               tar -xf deps-cache/deps.tar -C /
               restored=1
               echo "deps: restored from verified cache"
             else
-              echo "deps: cache failed verification, rebuilding"
+              echo "deps: cache failed verification ($fail), rebuilding"
             fi
           fi
           if [ "$restored" = "0" ]; then

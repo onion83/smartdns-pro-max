@@ -25,11 +25,17 @@ MAIN_OBJ = main.o
 
 # ============================================================================
 # Dependency detection: OpenSSL + libcurl
-# Priority: LOCAL_DEPS_PREFIX (/opt) > ../third_party/ > system (if allowed)
+# Priority: LOCAL_DEPS_PREFIX (/opt) > ../third_party/ > cross sysroot > system (if allowed)
+# The cross sysroot path covers toolchain builds that install the
+# dependencies into the cross compiler's sysroot (e.g. release.yml
+# compiles OpenSSL with --prefix=$($CC --print-sysroot)).
 # ============================================================================
 
+# Cross compiler sysroot (empty or "/" for native compilers without one)
+CROSS_SYSROOT := $(shell $(CC) --print-sysroot 2>/dev/null)
+
 # --- OpenSSL detection ---
-# Search order: LOCAL_DEPS_PREFIX/openssl > ../third_party/openssl/install > system
+# Search order: LOCAL_DEPS_PREFIX/openssl > ../third_party/openssl/install > $(CC) sysroot > system
 OPENSSL_PREFIX :=
 ifdef LOCAL_DEPS_PREFIX
   ifneq ("$(wildcard $(LOCAL_DEPS_PREFIX)/openssl/include/openssl/ssl.h)","")
@@ -44,6 +50,16 @@ ifndef OPENSSL_PREFIX
   endif
 endif
 ifndef OPENSSL_PREFIX
+  ifneq ("$(CROSS_SYSROOT)","")
+    ifneq ("$(CROSS_SYSROOT)","/")
+      ifneq ("$(wildcard $(CROSS_SYSROOT)/include/openssl/ssl.h)","")
+        OPENSSL_PREFIX := $(CROSS_SYSROOT)
+        $(info OpenSSL: using cross sysroot prefix $(OPENSSL_PREFIX))
+      endif
+    endif
+  endif
+endif
+ifndef OPENSSL_PREFIX
   ifeq ($(USE_SYSTEM_LIBS), 1)
     HAS_SYSTEM_OPENSSL := $(shell pkg-config --exists openssl 2>/dev/null && echo 1 || echo 0)
     ifeq ($(HAS_SYSTEM_OPENSSL), 1)
@@ -53,7 +69,9 @@ ifndef OPENSSL_PREFIX
   endif
 endif
 ifndef OPENSSL_PREFIX
-  $(error OpenSSL not found. Install to $$(LOCAL_DEPS_PREFIX)/openssl or ../third_party/openssl/install, or set USE_SYSTEM_LIBS=1)
+  ifeq ($(filter clean,$(MAKECMDGOALS)),)
+    $(error OpenSSL not found. Install to $$(LOCAL_DEPS_PREFIX)/openssl or ../third_party/openssl/install, or set USE_SYSTEM_LIBS=1)
+  endif
 endif
 
 # OpenSSL link mode: prefer shared if available (for dynamic builds), fallback to static
@@ -71,7 +89,9 @@ else ifneq ("$(wildcard $(OPENSSL_LIBDIR)/libssl.a)","")
   SSL_RPATH :=
   $(info OpenSSL: static linking from $(OPENSSL_LIBDIR))
 else
-  $(error OpenSSL libraries not found in $(OPENSSL_LIBDIR))
+  ifeq ($(filter clean,$(MAKECMDGOALS)),)
+    $(error OpenSSL libraries not found in $(OPENSSL_LIBDIR))
+  endif
 endif
 
 # --- libcurl detection ---
@@ -87,6 +107,16 @@ ifndef CURL_PREFIX
   ifneq ("$(wildcard ../third_party/curl/install/include/curl/curl.h)","")
     CURL_PREFIX := ../third_party/curl/install
     $(info libcurl: using third_party prefix $(CURL_PREFIX))
+  endif
+endif
+ifndef CURL_PREFIX
+  ifneq ("$(CROSS_SYSROOT)","")
+    ifneq ("$(CROSS_SYSROOT)","/")
+      ifneq ("$(wildcard $(CROSS_SYSROOT)/include/curl/curl.h)","")
+        CURL_PREFIX := $(CROSS_SYSROOT)
+        $(info libcurl: using cross sysroot prefix $(CURL_PREFIX))
+      endif
+    endif
   endif
 endif
 ifndef CURL_PREFIX
@@ -119,7 +149,9 @@ else
     CURL_RPATH :=
     $(info libcurl: static linking from $(CURL_LIBDIR))
   else
-    $(error libcurl libraries not found in $(CURL_LIBDIR))
+    ifeq ($(filter clean,$(MAKECMDGOALS)),)
+      $(error libcurl libraries not found in $(CURL_LIBDIR))
+    endif
   endif
 endif
 

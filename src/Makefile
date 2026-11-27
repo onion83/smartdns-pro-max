@@ -229,11 +229,22 @@ endif
 ifeq ($(WITH_ZLIB), auto)
  ifeq ($(HAS_ZLIB), 1)
   override CFLAGS += -DWITH_ZLIB
-  override LDFLAGS += -lz
+  ifdef STATIC_DEPS
+   # This -lz lands early in the link line; in hybrid mode it must
+   # resolve to the archive, otherwise libz.so becomes a NEEDED entry
+   # and later static -lz repeats pull nothing.
+   override LDFLAGS += -Wl,-Bstatic -lz -Wl,-Bdynamic
+  else
+   override LDFLAGS += -lz
+  endif
  endif
 else ifeq ($(WITH_ZLIB), 1)
 override CFLAGS += -DWITH_ZLIB
-override LDFLAGS += -lz
+ifdef STATIC_DEPS
+ override LDFLAGS += -Wl,-Bstatic -lz -Wl,-Bdynamic
+else
+ override LDFLAGS += -lz
+endif
 endif
 
 override CFLAGS +=-Iinclude

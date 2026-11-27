@@ -1,0 +1,482 @@
+# Build smartdns for four Linux variants and pack each variant into
+# two gzip tarballs (plain and with-UI):
+#
+#   smartdns-linux-<arch>-<libc>-<YYYYMMDD>.tar.gz      (no UI)
+#   smartdns-ui-linux-<arch>-<libc>-<YYYYMMDD>.tar.gz   (with UI)
+#
+#   <arch>: amd64 / arm64, <libc>: glibc / musl, date in Asia/Shanghai.
+#
+# Layout inside every tarball (top folder "smartdns/"):
+#   plain: smartdns/smartdns
+#   ui:    smartdns/smartdns, smartdns/smartdns_ui.so, smartdns/www/
+#
+# The www frontend is platform-independent, so it is built ONCE in the
+# "www" job from the separate onion83/smartdns-webui project (Next.js
+# static export) and copied into every platform's UI package.
+#
+# Manual trigger only (Actions -> "Build SmartDNS Pro Max" -> Run
+# workflow). Pick the branch to build when dispatching. The tarballs
+# are published to a formal (non-prerelease) GitHub Release tagged
+# "Release-YYMMDD" (Asia/Shanghai date), one per day, so the newest
+# build shows as the latest release on the repository home page.
+#
+# All platform jobs prefer the repo's own third-party dependencies:
+# OpenSSL 4.1.0 and curl 8.23.0 are built into /opt by the repo's
+# third_party scripts and picked up via LOCAL_DEPS_PREFIX=/opt, which
+# outranks the system libraries in src/Makefile detection (system is
+# only the fallback). The /opt copies are built static-only (no .so
+# files at all) and linking is the Makefile's STATIC_DEPS mode, so
+# OpenSSL, libcurl, zlib and libcurl's own compression tail (zstd,
+# brotli) are all compiled in and the binary runs on a bare system.
+# libc/libgcc_s deliberately stay dynamic: the Makefile's full-static
+# mode (-static) is incompatible with loading the smartdns_ui.so
+# plugin via dlopen. The plugin itself is built fully self-contained
+# (musl target, gcc_s replaced by static libgcc via the repo's
+# ld-static-gcc.sh wrapper).
+# The compression dev packages are installed BEFORE building curl
+# (the same approach as the repo's Dockerfile.builder-base) so curl
+# picks the features up and their archives exist at link time.
+# glibc jobs run natively on GitHub runners (x86_64 and ARM64); the
+# x86_64-musl job runs inside Alpine as a job container, mirroring
+# Dockerfile.builder-base-amd64. The arm64-musl job cannot (GitHub
+# does not support JavaScript actions in Alpine containers on Arm64),
+# so it drives Alpine through docker from the host instead.
+
+name: Build SmartDNS Pro Max
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  www:
+    name: www (smartdns-webui, built once)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout smartdns-webui
+        uses: actions/checkout@v5
+        with:
+          repository: onion83/smartdns-webui
+          ref: feature/geosite
+          path: smartdns-webui
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Build www (Next.js static export)
+        working-directory: smartdns-webui
+        run: |
+          npm ci
+          npm run build
+          test -f out/index.html
+          du -sh out
+
+      - name: Upload www artifact (reused by all platforms)
+        uses: actions/upload-artifact@v6
+        with:
+          name: www
+          path: smartdns-webui/out
+          if-no-files-found: error
+          retention-days: 30
+
+  build:
+    name: ${{ matrix.label }}
+    needs: www
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64-glibc
+            runner: ubuntu-24.04
+            container: ~
+            kind: glibc
+            arch: amd64
+            libc: glibc
+          - label: linux-aarch64-glibc
+            runner: ubuntu-24.04-arm
+            container: ~
+            kind: glibc
+            arch: arm64
+            libc: glibc
+          - label: linux-x86_64-musl
+            runner: ubuntu-24.04
+            container: alpine:3.24
+            kind: musl
+            arch: amd64
+            libc: musl
+          - label: linux-aarch64-musl
+            runner: ubuntu-24.04-arm
+            container: ~
+            kind: musl-docker
+            arch: arm64
+            libc: musl
+
+    steps:
+      - name: Install tools (glibc runners)
+        if: matrix.kind == 'glibc'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config git perl wget ca-certificates \
+            zlib1g-dev libzstd-dev libbrotli-dev clang libclang-dev file
+          # zlib1g-dev/libzstd-dev/libbrotli-dev ship the static archives
+          # that the /opt libcurl.a needs at link time; the workflow
+          # links them with -Bstatic, so no runtime copies are needed.
+
+      - name: Install tools (musl, Alpine)
+        if: matrix.kind == 'musl'
+        run: |
+          apk add --no-cache \
+            build-base linux-headers musl-dev zlib-dev zlib-static \
+            zstd-dev zstd-static brotli-dev brotli-static \
+            pkgconf git ca-certificates perl wget bash tzdata tar xz \
+            llvm-dev clang clang-dev file github-cli
+          # GNU tar (shadowing busybox tar) is required by
+          # actions/cache inside Alpine containers; with busybox tar
+          # its save step fails and the cache never persists. GNU tar
+          # in turn needs the external xz binary for .tar.xz sources
+          # (busybox tar had that built in), hence the xz package.
+
+      - name: Install Rust
+        if: matrix.kind == 'glibc'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust (musl, Alpine)
+        if: matrix.kind == 'musl'
+        shell: bash
+        run: |
+          wget -qO- https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Cache bindgen
+        id: cache-bindgen
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/bindgen
+          key: ${{ matrix.label }}-bindgen-v1
+
+      - name: Install bindgen
+        if: steps.cache-bindgen.outputs.cache-hit != 'true' && matrix.kind != 'musl-docker'
+        shell: bash
+        run: cargo install --force --locked bindgen-cli
+
+      - name: Download www (built once in the www job)
+        uses: actions/download-artifact@v7
+        with:
+          name: www
+          path: www-out
+
+      - name: Cache third-party sources
+        uses: actions/cache@v5
+        with:
+          path: src-cache
+          # Pristine extracted upstream sources: platform-neutral, so
+          # one entry serves all platforms. The tarballs' bytes are
+          # pinned by official SHA256 sums checked in the deps step,
+          # so the key only carries the versions and an epoch suffix.
+          key: src-ssl4.1.0-curl8.23.0-v1
+
+      - name: Cache /opt dependencies
+        uses: actions/cache@v5
+        with:
+          path: deps-cache
+          # Content-addressed key: platform label + dependency
+          # versions + hash of the two scripts that produce the
+          # content. Exact match only, deliberately NO restore-keys:
+          # a prefix "near match" would silently restore libraries
+          # built from different inputs. Entries are immutable once
+          # saved; if one ever went bad, bump the -vN suffix to
+          # orphan it and start a fresh lineage.
+          key: deps-${{ matrix.label }}-ssl4.1.0-curl8.23.0-${{ hashFiles('third_party/build_openssl.sh', 'third_party/build_curl.sh') }}-v2
+
+      - name: Build custom dependencies into /opt (OpenSSL 4.1.0, curl 8.23.0)
+        if: matrix.kind != 'musl-docker'
+        shell: bash
+        run: |
+          if [ "${{ matrix.kind }}" = "glibc" ]; then SUDO=sudo; else SUDO=; fi
+          restored=0
+          if [ -f deps-cache/deps.tar ] && [ -f deps-cache/deps.tar.sha256 ]; then
+            # Verify before trusting the cache: payload checksum, the
+            # two static archives present, and no shared libssl /
+            # libcrypto / libcurl inside (static-only invariant).
+            # Each check is named so the log shows which one failed.
+            fail=""
+            (cd deps-cache && sha256sum -c deps.tar.sha256 >/dev/null) || fail="sha256"
+            listing="$(tar -tf deps-cache/deps.tar)"
+            [ -n "$fail" ] || printf '%s' "$listing" | grep -qE 'opt/openssl/lib(64)?/libssl\.a' || fail="libssl.a-missing"
+            [ -n "$fail" ] || printf '%s' "$listing" | grep -qE 'opt/curl/lib(64)?/libcurl\.a' || fail="libcurl.a-missing"
+            if [ -z "$fail" ] && printf '%s' "$listing" | grep -qE 'lib(ssl|crypto|curl)\.so'; then fail="shared-lib-present"; fi
+            if [ -z "$fail" ]; then
+              $SUDO tar -xf deps-cache/deps.tar -C /
+              restored=1
+              echo "deps: restored from verified cache"
+            else
+              echo "deps: cache failed verification ($fail), rebuilding"
+            fi
+          fi
+          if [ "$restored" = "0" ]; then
+            # Static ONLY: with no .so files in /opt at all, nothing
+            # can pick a shared OpenSSL/curl up at build or runtime,
+            # and the resulting binary needs no OpenSSL/CURL shared
+            # libraries.
+            # Prepare pristine third-party sources. src-cache holds
+            # the hash-verified tarballs + extracted trees and is
+            # never built in (the build scripts dirty their source
+            # dir); on a source-cache miss, download, verify against
+            # the pinned official SHA256 sums, and extract here.
+            # The trees are then copied into the scripts' own
+            # download dirs, so the scripts skip both the download
+            # and the extraction (consuming jobs need no xz at all:
+            # sources arrive already extracted).
+            if [ ! -f src-cache/openssl-4.1.0/Configure ] || [ ! -f src-cache/curl-8.23.0/configure ]; then
+              mkdir -p src-cache
+              wget -q https://www.openssl.org/source/openssl-4.1.0.tar.gz -O src-cache/openssl-4.1.0.tar.gz
+              wget -q https://curl.se/download/curl-8.23.0.tar.xz -O src-cache/curl-8.23.0.tar.xz
+              (cd src-cache && printf '%s  %s\n%s  %s\n' \
+                50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd openssl-4.1.0.tar.gz \
+                8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5 curl-8.23.0.tar.xz \
+                | sha256sum -c -)
+              tar -xzf src-cache/openssl-4.1.0.tar.gz -C src-cache
+              tar -xf src-cache/curl-8.23.0.tar.xz -C src-cache
+            fi
+            mkdir -p third_party/openssl third_party/curl
+            cp -a src-cache/openssl-4.1.0.tar.gz src-cache/openssl-4.1.0 third_party/openssl/
+            cp -a src-cache/curl-8.23.0.tar.xz src-cache/curl-8.23.0 third_party/curl/
+            $SUDO env LOCAL_OPENSSL_INSTALL=/opt/openssl \
+              sh third_party/build_openssl.sh 4.1.0 static
+            $SUDO env LIBS="-ldl -lpthread -lz" LOCAL_CURL_INSTALL=/opt/curl \
+              LOCAL_OPENSSL_INSTALL=/opt/openssl \
+              sh third_party/build_curl.sh 8.23.0 static
+            mkdir -p deps-cache
+            $SUDO tar -cf deps-cache/deps.tar -C / opt/openssl opt/curl
+            (cd deps-cache && sha256sum deps.tar > deps.tar.sha256)
+          fi
+
+      - name: Build and pack (plain + ui tarballs)
+        if: matrix.kind != 'musl-docker'
+        shell: bash
+        run: |
+          export LOCAL_DEPS_PREFIX=/opt
+          DATE="$(TZ=Asia/Shanghai date +%Y%m%d)"
+          PKG_PLAIN="smartdns-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.tar.gz"
+          PKG_UI="smartdns-ui-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.tar.gz"
+          echo "PKG_PLAIN=${PKG_PLAIN}" >> "$GITHUB_ENV"
+          echo "PKG_UI=${PKG_UI}" >> "$GITHUB_ENV"
+          echo "PKG_PLAIN_BASE=${PKG_PLAIN%.tar.gz}" >> "$GITHUB_ENV"
+          echo "PKG_UI_BASE=${PKG_UI%.tar.gz}" >> "$GITHUB_ENV"
+          test -f www-out/index.html
+          check_needed() {
+            # The /opt dependencies are static-only builds, so the
+            # binary must not NEED any ssl/crypto/curl/z/compression
+            # shared lib; only libc/libgcc_s/libm may stay dynamic
+            # (dlopen plugins). Check readelf's NEEDED list, not ldd
+            # (which also shows transitive entries).
+            if readelf -d "$1" | grep -E "NEEDED.*(libssl|libcrypto|libcurl|libz\.|libzstd|libbrotli)"; then
+              echo "ERROR: binary still depends on a dynamic ssl/curl/z library" >&2
+              exit 1
+            fi
+          }
+          # ---- plain: no UI plugin, no www ----
+          make clean || true
+          make WITH_UI=0 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
+          file src/smartdns
+          ldd src/smartdns || true
+          check_needed src/smartdns
+          mkdir -p stage-plain/smartdns
+          cp src/smartdns stage-plain/smartdns/
+          (cd stage-plain && tar -cf - smartdns | gzip -9 > "../${PKG_PLAIN}")
+          # ---- ui: plugin + www (www copied from the www job) ----
+          make clean || true
+          make WITH_UI=1 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
+          file src/smartdns plugin/smartdns-ui/target/smartdns_ui.so
+          ldd src/smartdns || true
+          check_needed src/smartdns
+          mkdir -p stage-ui/smartdns/www
+          cp src/smartdns plugin/smartdns-ui/target/smartdns_ui.so stage-ui/smartdns/
+          cp -r www-out/. stage-ui/smartdns/www/
+          test -f stage-ui/smartdns/www/index.html
+          (cd stage-ui && tar -cf - smartdns | gzip -9 > "../${PKG_UI}")
+          echo "== ${PKG_PLAIN} =="
+          tar -tzf "${PKG_PLAIN}"
+          echo "== ${PKG_UI} (first entries) =="
+          # List via a file: piping tar into head would SIGPIPE tar
+          # and fail the step under pipefail.
+          tar -tzf "${PKG_UI}" > ui-list.txt
+          head -20 ui-list.txt
+          wc -l ui-list.txt
+
+      # arm64-musl cannot use a job container: GitHub does not support
+      # JavaScript actions in Alpine containers on Arm64 runners. So
+      # this job runs on the host and drives Alpine through docker;
+      # only the compile itself happens inside the container, while
+      # checkout/artifacts/release steps stay on the host.
+      - name: Build and pack (arm64-musl, via docker)
+        if: matrix.kind == 'musl-docker'
+        shell: bash
+        run: |
+          DATE="$(TZ=Asia/Shanghai date +%Y%m%d)"
+          PKG_PLAIN="smartdns-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.tar.gz"
+          PKG_UI="smartdns-ui-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.tar.gz"
+          echo "PKG_PLAIN=${PKG_PLAIN}" >> "$GITHUB_ENV"
+          echo "PKG_UI=${PKG_UI}" >> "$GITHUB_ENV"
+          echo "PKG_PLAIN_BASE=${PKG_PLAIN%.tar.gz}" >> "$GITHUB_ENV"
+          echo "PKG_UI_BASE=${PKG_UI%.tar.gz}" >> "$GITHUB_ENV"
+          export PKG_PLAIN PKG_UI
+          # Stage the host-cached bindgen (actions/cache path) into the
+          # workspace so the container can reuse it; the container uses
+          # its OWN CARGO_HOME/RUSTUP_HOME inside the workspace, never
+          # the host's ~/.cargo (glibc binaries would leak in).
+          mkdir -p .bindgen-cache
+          cp "$HOME/.cargo/bin/bindgen" .bindgen-cache/bindgen 2>/dev/null || true
+          cat > inside-build.sh <<'EOS'
+          apk add --no-cache \
+            build-base linux-headers musl-dev zlib-dev zlib-static \
+            zstd-dev zstd-static brotli-dev brotli-static \
+            pkgconf git ca-certificates perl wget curl bash tzdata \
+            llvm-dev clang clang-dev file
+          git config --global --add safe.directory /work
+          export RUSTUP_HOME=/work/.rustup-home CARGO_HOME=/work/.cargo-home
+          export PATH="$CARGO_HOME/bin:$PATH"
+          curl -sSfL https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal
+          command -v cargo
+          if [ -x /work/.bindgen-cache/bindgen ]; then
+            cp /work/.bindgen-cache/bindgen "$CARGO_HOME/bin/bindgen"
+          else
+            cargo install --force --locked bindgen-cli
+            cp "$CARGO_HOME/bin/bindgen" /work/.bindgen-cache/bindgen
+          fi
+          export LOCAL_DEPS_PREFIX=/opt
+          restored=0
+          if [ -f deps-cache/deps.tar ] && [ -f deps-cache/deps.tar.sha256 ]; then
+            fail=""
+            (cd deps-cache && sha256sum -c deps.tar.sha256 >/dev/null) || fail="sha256"
+            listing="$(tar -tf deps-cache/deps.tar)"
+            [ -n "$fail" ] || printf '%s' "$listing" | grep -qE 'opt/openssl/lib(64)?/libssl\.a' || fail="libssl.a-missing"
+            [ -n "$fail" ] || printf '%s' "$listing" | grep -qE 'opt/curl/lib(64)?/libcurl\.a' || fail="libcurl.a-missing"
+            if [ -z "$fail" ] && printf '%s' "$listing" | grep -qE 'lib(ssl|crypto|curl)\.so'; then fail="shared-lib-present"; fi
+            if [ -z "$fail" ]; then
+              tar -xf deps-cache/deps.tar -C /
+              restored=1
+              echo "deps: restored from verified cache"
+            else
+              echo "deps: cache failed verification ($fail), rebuilding"
+            fi
+          fi
+          if [ "$restored" = "0" ]; then
+            # Prepare pristine third-party sources. src-cache holds
+            # the hash-verified tarballs + extracted trees and is
+            # never built in (the build scripts dirty their source
+            # dir); on a source-cache miss, download, verify against
+            # the pinned official SHA256 sums, and extract here.
+            # The trees are then copied into the scripts' own
+            # download dirs, so the scripts skip both the download
+            # and the extraction (consuming jobs need no xz at all:
+            # sources arrive already extracted).
+            if [ ! -f src-cache/openssl-4.1.0/Configure ] || [ ! -f src-cache/curl-8.23.0/configure ]; then
+              mkdir -p src-cache
+              wget -q https://www.openssl.org/source/openssl-4.1.0.tar.gz -O src-cache/openssl-4.1.0.tar.gz
+              wget -q https://curl.se/download/curl-8.23.0.tar.xz -O src-cache/curl-8.23.0.tar.xz
+              (cd src-cache && printf '%s  %s\n%s  %s\n' \
+                50c17baf54cb008f6ce42d50deb4b28050a1aad711636cabd4b241c7e90cc2fd openssl-4.1.0.tar.gz \
+                8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5 curl-8.23.0.tar.xz \
+                | sha256sum -c -)
+              tar -xzf src-cache/openssl-4.1.0.tar.gz -C src-cache
+              tar -xf src-cache/curl-8.23.0.tar.xz -C src-cache
+            fi
+            mkdir -p third_party/openssl third_party/curl
+            cp -a src-cache/openssl-4.1.0.tar.gz src-cache/openssl-4.1.0 third_party/openssl/
+            cp -a src-cache/curl-8.23.0.tar.xz src-cache/curl-8.23.0 third_party/curl/
+            env LOCAL_OPENSSL_INSTALL=/opt/openssl \
+              sh third_party/build_openssl.sh 4.1.0 static
+            env LIBS="-ldl -lpthread -lz" LOCAL_CURL_INSTALL=/opt/curl \
+              LOCAL_OPENSSL_INSTALL=/opt/openssl \
+              sh third_party/build_curl.sh 8.23.0 static
+            mkdir -p deps-cache
+            tar -cf deps-cache/deps.tar -C / opt/openssl opt/curl
+            (cd deps-cache && sha256sum deps.tar > deps.tar.sha256)
+          fi
+          check_needed() {
+            if readelf -d "$1" | grep -E "NEEDED.*(libssl|libcrypto|libcurl|libz\.|libzstd|libbrotli)"; then
+              echo "ERROR: binary still depends on a dynamic ssl/curl/z library" >&2
+              exit 1
+            fi
+          }
+          test -f www-out/index.html
+          make clean || true
+          make WITH_UI=0 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
+          file src/smartdns
+          check_needed src/smartdns
+          mkdir -p stage-plain/smartdns
+          cp src/smartdns stage-plain/smartdns/
+          (cd stage-plain && tar -cf - smartdns | gzip -9 > "../${PKG_PLAIN}")
+          make clean || true
+          make WITH_UI=1 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
+          file src/smartdns plugin/smartdns-ui/target/smartdns_ui.so
+          check_needed src/smartdns
+          mkdir -p stage-ui/smartdns/www
+          cp src/smartdns plugin/smartdns-ui/target/smartdns_ui.so stage-ui/smartdns/
+          cp -r www-out/. stage-ui/smartdns/www/
+          test -f stage-ui/smartdns/www/index.html
+          (cd stage-ui && tar -cf - smartdns | gzip -9 > "../${PKG_UI}")
+          tar -tzf "${PKG_PLAIN}"
+          tar -tzf "${PKG_UI}" > ui-list.txt
+          head -20 ui-list.txt
+          EOS
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/work" -w /work \
+            -e PKG_PLAIN -e PKG_UI \
+            alpine:3.24 sh -e /work/inside-build.sh
+          # Hand a container-built bindgen back to the host cache path
+          # so the actions/cache post-step can save it for next time.
+          mkdir -p "$HOME/.cargo/bin"
+          cp .bindgen-cache/bindgen "$HOME/.cargo/bin/bindgen" 2>/dev/null || true
+
+      - name: Upload plain tarball as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.PKG_PLAIN_BASE }}
+          path: ${{ env.PKG_PLAIN }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload ui tarball as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.PKG_UI_BASE }}
+          path: ${{ env.PKG_UI }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish tarballs to the dated formal release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # gh shells out to git; inside the musl container git refuses
+          # the checkout over ownership, so mark it safe first.
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}" || true
+          # One formal release per day, tagged Release-YYMMDD
+          # (Asia/Shanghai). Deliberately NOT a prerelease: the newest
+          # dated release becomes the "latest" release shown on the
+          # repository home page. The four platform jobs race to create
+          # it, so a failed create (another job won) is fine: the
+          # upload below is the idempotent part and runs for everyone.
+          TAG="Release-$(TZ=Asia/Shanghai date +%y%m%d)"
+          gh release view "${TAG}" >/dev/null 2>&1 || \
+            gh release create "${TAG}" --target "${GITHUB_SHA}" \
+              --title "${TAG}" \
+              --notes "Automated build of SmartDNS Pro Max (${GITHUB_REF_NAME}, ${GITHUB_SHA})." \
+              || true
+          gh release upload "${TAG}" "${PKG_PLAIN}" "${PKG_UI}" --clobber

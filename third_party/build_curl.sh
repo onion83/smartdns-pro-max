@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build libcurl as both static and shared libraries for smartdns.
 # Usage: third_party/build_curl.sh [VERSION] [static|shared|both]
-#   VERSION  defaults to 8.20.0
+#   VERSION  defaults to 8.23.0
 #   Mode     defaults to both (build both static and shared)
 #
 # Environment variables:
@@ -12,7 +12,7 @@
 
 set -e
 
-CURL_VERSION="${1:-8.20.0}"
+CURL_VERSION="${1:-8.23.0}"
 BUILD_MODE="${2:-both}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DOWNLOAD_DIR="${CURL_DOWNLOAD_DIR:-${SCRIPT_DIR}/curl}"

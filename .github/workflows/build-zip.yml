@@ -13,17 +13,17 @@
 # and curl 8.23.0 are built into /opt by the repo's third_party scripts
 # and picked up via LOCAL_DEPS_PREFIX=/opt, which outranks the system
 # libraries in src/Makefile detection (system is only the fallback).
-# Linking is STATIC_DEPS: OpenSSL, libcurl and zlib are linked from
-# static archives directly, so the custom libcurl is compiled in, not
-# loaded at runtime. libc/libgcc_s deliberately stay dynamic: the
-# Makefile's full-static mode (-static) is incompatible with loading
-# the smartdns_ui.so plugin via dlopen. The plugin itself is built
-# fully self-contained (musl target, gcc_s replaced by static libgcc
-# via the repo's ld-static-gcc.sh wrapper).
-# zlib: libcurl depends on it. It is installed BEFORE building curl
-# (apk zlib-static / apt zlib1g-dev, the same approach as the repo's
-# Dockerfile.builder-base) so curl picks it up, and the final link
-# scopes -lz with -Wl,-Bstatic, leaving no DT_NEEDED for libz.
+# Linking: OpenSSL, libcurl and zlib are linked from static archives
+# directly (see EXTRA_LDFLAGS in the build step), so the custom libcurl
+# is compiled in, not loaded at runtime. libc/libgcc_s deliberately
+# stay dynamic: the Makefile's full-static mode (-static) is
+# incompatible with loading the smartdns_ui.so plugin via dlopen. The
+# plugin itself is built fully self-contained (musl target, gcc_s
+# replaced by static libgcc via the repo's ld-static-gcc.sh wrapper).
+# libcurl's dependency tail (zlib, zstd, brotli) is installed BEFORE
+# building curl (static dev packages, the same approach as the repo's
+# Dockerfile.builder-base) so curl picks the features up, and the
+# final link pulls their archives in with -Wl,-Bstatic.
 # glibc jobs run natively on GitHub runners (x86_64 and ARM64); the musl
 # job runs inside Alpine, mirroring Dockerfile.builder-base-amd64.
 
@@ -64,15 +64,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config git perl wget ca-certificates \
-            zlib1g-dev clang libclang-dev zip file
-          # zlib1g-dev ships libz.a alongside libz.so; the STATIC_DEPS
-          # link scopes -lz with -Bstatic, so no runtime libz is needed.
+            zlib1g-dev libzstd-dev libbrotli-dev clang libclang-dev zip file
+          # zlib1g-dev/libzstd-dev/libbrotli-dev ship the static archives
+          # that the /opt libcurl.a needs at link time; the workflow
+          # links them with -Bstatic, so no runtime copies are needed.
 
       - name: Install tools (musl, Alpine)
         if: matrix.kind == 'musl'
         run: |
           apk add --no-cache \
             build-base linux-headers musl-dev zlib-dev zlib-static \
+            zstd-dev zstd-static brotli-dev brotli-static \
             pkgconf git ca-certificates perl wget bash \
             llvm-dev clang clang-dev zip file
 
@@ -116,10 +118,18 @@ jobs:
 
       - name: Build smartdns + UI plugin
         shell: bash
+        env:
+          # Hand the whole dependency tail to the linker explicitly.
+          # The Makefile's STATIC_DEPS mode cannot express it: its
+          # rpath flags land before the archives (so shared OpenSSL
+          # wins and libcurl.a keeps OCSP/trace symbols that libssl.a
+          # lacks), and curl's own deps (zstd, brotli) are missing.
+          # Order matters: archives first, their shared deps after.
+          EXTRA_LDFLAGS: /opt/openssl/lib/libssl.a /opt/openssl/lib/libcrypto.a /opt/curl/lib/libcurl.a -Wl,-Bstatic -lz -lzstd -lbrotlidec -lbrotlicommon -Wl,-Bdynamic
         run: |
           export LOCAL_DEPS_PREFIX=/opt
           make clean || true
-          make WITH_UI=1 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
+          make WITH_UI=1 OPTIMIZE_SIZE=1 -j"$(nproc)"
 
       - name: Pack zip (smartdns + smartdns_ui.so only)
         shell: bash

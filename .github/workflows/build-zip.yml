@@ -13,17 +13,17 @@
 # and curl 8.23.0 are built into /opt by the repo's third_party scripts
 # and picked up via LOCAL_DEPS_PREFIX=/opt, which outranks the system
 # libraries in src/Makefile detection (system is only the fallback).
-# Linking: OpenSSL, libcurl and zlib are linked from static archives
-# directly (see EXTRA_LDFLAGS in the build step), so the custom libcurl
-# is compiled in, not loaded at runtime. libc/libgcc_s deliberately
-# stay dynamic: the Makefile's full-static mode (-static) is
-# incompatible with loading the smartdns_ui.so plugin via dlopen. The
-# plugin itself is built fully self-contained (musl target, gcc_s
-# replaced by static libgcc via the repo's ld-static-gcc.sh wrapper).
-# libcurl's dependency tail (zlib, zstd, brotli) is installed BEFORE
-# building curl (static dev packages, the same approach as the repo's
-# Dockerfile.builder-base) so curl picks the features up, and the
-# final link pulls their archives in with -Wl,-Bstatic.
+# Linking is the Makefile's STATIC_DEPS mode: OpenSSL, libcurl, zlib
+# and libcurl's own compression tail (zstd, brotli) are linked from
+# static archives, so the custom libcurl is compiled in, not loaded at
+# runtime. libc/libgcc_s deliberately stay dynamic: the Makefile's
+# full-static mode (-static) is incompatible with loading the
+# smartdns_ui.so plugin via dlopen. The plugin itself is built fully
+# self-contained (musl target, gcc_s replaced by static libgcc via the
+# repo's ld-static-gcc.sh wrapper).
+# The compression dev packages are installed BEFORE building curl
+# (the same approach as the repo's Dockerfile.builder-base) so curl
+# picks the features up and their archives exist at link time.
 # glibc jobs run natively on GitHub runners (x86_64 and ARM64); the musl
 # job runs inside Alpine, mirroring Dockerfile.builder-base-amd64.
 
@@ -118,18 +118,10 @@ jobs:
 
       - name: Build smartdns + UI plugin
         shell: bash
-        env:
-          # Hand the whole dependency tail to the linker explicitly.
-          # The Makefile's STATIC_DEPS mode cannot express it: its
-          # rpath flags land before the archives (so shared OpenSSL
-          # wins and libcurl.a keeps OCSP/trace symbols that libssl.a
-          # lacks), and curl's own deps (zstd, brotli) are missing.
-          # Order matters: archives first, their shared deps after.
-          EXTRA_LDFLAGS: /opt/openssl/lib/libssl.a /opt/openssl/lib/libcrypto.a /opt/curl/lib/libcurl.a -Wl,-Bstatic -lz -lzstd -lbrotlidec -lbrotlicommon -Wl,-Bdynamic
         run: |
           export LOCAL_DEPS_PREFIX=/opt
           make clean || true
-          make WITH_UI=1 OPTIMIZE_SIZE=1 -j"$(nproc)"
+          make WITH_UI=1 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
 
       - name: Pack zip (smartdns + smartdns_ui.so only)
         shell: bash
@@ -141,8 +133,12 @@ jobs:
           echo "== dynamic dependencies (libc/libgcc_s only, by design) =="
           ldd src/smartdns || true
           ldd plugin/smartdns-ui/target/smartdns_ui.so || true
-          if readelf -d src/smartdns | grep -E "NEEDED.*(libssl|libcrypto|libcurl|libz\.)"; then
-            echo "ERROR: binary still depends on a system ssl/curl/z library" >&2
+          # libssl.so/libcrypto.so from /opt are expected NEEDED entries:
+          # libcurl.a was built against the shared OpenSSL and references
+          # symbols the static libssl.a does not export, so the Makefile
+          # links that part dynamically. Everything else must be static.
+          if readelf -d src/smartdns | grep -E "NEEDED.*(libcurl|libz\.|libzstd|libbrotli)"; then
+            echo "ERROR: binary still depends on a dynamic curl/z/compression library" >&2
             exit 1
           fi
           mkdir -p dist

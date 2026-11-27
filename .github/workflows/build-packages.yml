@@ -218,7 +218,11 @@ jobs:
           echo "== ${PKG_PLAIN} =="
           tar -tzf "${PKG_PLAIN}"
           echo "== ${PKG_UI} (first entries) =="
-          tar -tzf "${PKG_UI}" | head -20
+          # List via a file: piping tar into head would SIGPIPE tar
+          # and fail the step under pipefail.
+          tar -tzf "${PKG_UI}" > ui-list.txt
+          head -20 ui-list.txt
+          wc -l ui-list.txt
 
       - name: Upload plain tarball as artifact
         uses: actions/upload-artifact@v6

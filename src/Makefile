@@ -25,107 +25,102 @@ MAIN_OBJ = main.o
 
 # ============================================================================
 # Dependency detection: OpenSSL + libcurl
-# Priority: LOCAL_DEPS_PREFIX (/opt) > ../third_party/ > cross sysroot > system (if allowed)
-# The cross sysroot path covers toolchain builds that install the
-# dependencies into the cross compiler's sysroot (e.g. release.yml
-# compiles OpenSSL with --prefix=$($CC --print-sysroot)).
+# Priority: ../third_party/ (vendored, built by third_party/build_*.sh)
+# > LOCAL_DEPS_PREFIX (e.g. /opt in the builder images)
+# > compiler default search path (system libraries, or the cross
+#   toolchain sysroot which is part of the default search path)
 # ============================================================================
 
-# Cross compiler sysroot (empty or "/" for native compilers without one)
-CROSS_SYSROOT := $(shell $(CC) --print-sysroot 2>/dev/null)
-
 # --- OpenSSL detection ---
-# Search order: LOCAL_DEPS_PREFIX/openssl > ../third_party/openssl/install > $(CC) sysroot > system
+# Search order: ../third_party/openssl/install > LOCAL_DEPS_PREFIX/openssl > default search path
 OPENSSL_PREFIX :=
-ifdef LOCAL_DEPS_PREFIX
-  ifneq ("$(wildcard $(LOCAL_DEPS_PREFIX)/openssl/include/openssl/ssl.h)","")
-    OPENSSL_PREFIX := $(LOCAL_DEPS_PREFIX)/openssl
-    $(info OpenSSL: using custom prefix $(OPENSSL_PREFIX))
-  endif
-endif
 ifndef OPENSSL_PREFIX
   ifneq ("$(wildcard ../third_party/openssl/install/include/openssl/ssl.h)","")
     OPENSSL_PREFIX := ../third_party/openssl/install
     $(info OpenSSL: using third_party prefix $(OPENSSL_PREFIX))
   endif
 endif
-ifndef OPENSSL_PREFIX
-  ifneq ("$(CROSS_SYSROOT)","")
-    ifneq ("$(CROSS_SYSROOT)","/")
-      ifneq ("$(wildcard $(CROSS_SYSROOT)/include/openssl/ssl.h)","")
-        OPENSSL_PREFIX := $(CROSS_SYSROOT)
-        $(info OpenSSL: using cross sysroot prefix $(OPENSSL_PREFIX))
-      endif
+ifdef LOCAL_DEPS_PREFIX
+  ifndef OPENSSL_PREFIX
+    ifneq ("$(wildcard $(LOCAL_DEPS_PREFIX)/openssl/include/openssl/ssl.h)","")
+      OPENSSL_PREFIX := $(LOCAL_DEPS_PREFIX)/openssl
+      $(info OpenSSL: using custom prefix $(OPENSSL_PREFIX))
     endif
   endif
 endif
 ifndef OPENSSL_PREFIX
-  ifeq ($(USE_SYSTEM_LIBS), 1)
-    HAS_SYSTEM_OPENSSL := $(shell pkg-config --exists openssl 2>/dev/null && echo 1 || echo 0)
-    ifeq ($(HAS_SYSTEM_OPENSSL), 1)
-      OPENSSL_PREFIX := /usr
-      $(info OpenSSL: using system prefix)
-    endif
+  # Fall back to the compiler's default search path (system libraries,
+  # or the cross sysroot). Verify with a compile+link probe.
+  # Header must compile and the linker must find libssl in the default
+  # search path. No full link: a static libssl may need extra libs
+  # (e.g. -latomic on MIPS32) that the real build adds separately.
+  HAS_DEFAULT_OPENSSL := $(shell printf '#include <openssl/ssl.h>\nint main(void) { return 0; }' | $(CC) -x c - -c -o /dev/null >/dev/null 2>&1 && { test "`$(CC) -print-file-name=libssl.so`" != "libssl.so" || test "`$(CC) -print-file-name=libssl.a`" != "libssl.a"; } && echo -n 1 || echo -n 0)
+  ifeq ($(HAS_DEFAULT_OPENSSL), 1)
+    OPENSSL_PREFIX := default
+    $(info OpenSSL: using compiler default search path)
   endif
 endif
 ifndef OPENSSL_PREFIX
   ifeq ($(filter clean,$(MAKECMDGOALS)),)
-    $(error OpenSSL not found. Install to $$(LOCAL_DEPS_PREFIX)/openssl or ../third_party/openssl/install, or set USE_SYSTEM_LIBS=1)
+    $(error OpenSSL not found. Build it into ../third_party/openssl/install with third_party/build_openssl.sh, or install it into $$(LOCAL_DEPS_PREFIX)/openssl or the system)
   endif
 endif
 
 # OpenSSL link mode: prefer shared if available (for dynamic builds), fallback to static
-OPENSSL_LIBDIR := $(OPENSSL_PREFIX)/lib
-ifneq ("$(wildcard $(OPENSSL_LIBDIR)/libssl.so)","")
-  # Shared OpenSSL found
-  SSL_CFLAGS := -I$(OPENSSL_PREFIX)/include
-  SSL_LDFLAGS := -L$(OPENSSL_LIBDIR) -lssl -lcrypto
-  SSL_RPATH := -Wl,-rpath,$(OPENSSL_LIBDIR)
-  $(info OpenSSL: dynamic linking from $(OPENSSL_LIBDIR))
-else ifneq ("$(wildcard $(OPENSSL_LIBDIR)/libssl.a)","")
-  # Static OpenSSL found
-  SSL_CFLAGS := -I$(OPENSSL_PREFIX)/include
-  SSL_LDFLAGS := $(OPENSSL_LIBDIR)/libssl.a $(OPENSSL_LIBDIR)/libcrypto.a
+ifeq ($(OPENSSL_PREFIX),default)
+  SSL_CFLAGS :=
+  SSL_LDFLAGS := -lssl -lcrypto
   SSL_RPATH :=
-  $(info OpenSSL: static linking from $(OPENSSL_LIBDIR))
-else
-  ifeq ($(filter clean,$(MAKECMDGOALS)),)
-    $(error OpenSSL libraries not found in $(OPENSSL_LIBDIR))
+else ifdef OPENSSL_PREFIX
+  # The install may use lib/ (OpenSSL 3.x, custom builds) or lib64/ (OpenSSL 4.x default)
+  ifneq ("$(wildcard $(OPENSSL_PREFIX)/lib/libssl.so)$(wildcard $(OPENSSL_PREFIX)/lib/libssl.a)","")
+    OPENSSL_LIBDIR := $(OPENSSL_PREFIX)/lib
+  else ifneq ("$(wildcard $(OPENSSL_PREFIX)/lib64/libssl.so)$(wildcard $(OPENSSL_PREFIX)/lib64/libssl.a)","")
+    OPENSSL_LIBDIR := $(OPENSSL_PREFIX)/lib64
+  endif
+  ifndef OPENSSL_LIBDIR
+    ifeq ($(filter clean,$(MAKECMDGOALS)),)
+      $(error OpenSSL libraries not found in $(OPENSSL_PREFIX)/lib or $(OPENSSL_PREFIX)/lib64)
+    endif
+  else ifneq ("$(wildcard $(OPENSSL_LIBDIR)/libssl.so)","")
+    # Shared OpenSSL found
+    SSL_CFLAGS := -I$(OPENSSL_PREFIX)/include
+    SSL_LDFLAGS := -L$(OPENSSL_LIBDIR) -lssl -lcrypto
+    SSL_RPATH := -Wl,-rpath,$(OPENSSL_LIBDIR)
+    $(info OpenSSL: dynamic linking from $(OPENSSL_LIBDIR))
+  else
+    # Static OpenSSL found
+    SSL_CFLAGS := -I$(OPENSSL_PREFIX)/include
+    SSL_LDFLAGS := $(OPENSSL_LIBDIR)/libssl.a $(OPENSSL_LIBDIR)/libcrypto.a
+    SSL_RPATH :=
+    $(info OpenSSL: static linking from $(OPENSSL_LIBDIR))
   endif
 endif
 
 # --- libcurl detection ---
-# Search order: LOCAL_DEPS_PREFIX/curl > ../third_party/curl/install > system
+# Search order: ../third_party/curl/install > LOCAL_DEPS_PREFIX/curl > default search path
 CURL_PREFIX :=
-ifdef LOCAL_DEPS_PREFIX
-  ifneq ("$(wildcard $(LOCAL_DEPS_PREFIX)/curl/include/curl/curl.h)","")
-    CURL_PREFIX := $(LOCAL_DEPS_PREFIX)/curl
-    $(info libcurl: using custom prefix $(CURL_PREFIX))
-  endif
-endif
 ifndef CURL_PREFIX
   ifneq ("$(wildcard ../third_party/curl/install/include/curl/curl.h)","")
     CURL_PREFIX := ../third_party/curl/install
     $(info libcurl: using third_party prefix $(CURL_PREFIX))
   endif
 endif
-ifndef CURL_PREFIX
-  ifneq ("$(CROSS_SYSROOT)","")
-    ifneq ("$(CROSS_SYSROOT)","/")
-      ifneq ("$(wildcard $(CROSS_SYSROOT)/include/curl/curl.h)","")
-        CURL_PREFIX := $(CROSS_SYSROOT)
-        $(info libcurl: using cross sysroot prefix $(CURL_PREFIX))
-      endif
+ifdef LOCAL_DEPS_PREFIX
+  ifndef CURL_PREFIX
+    ifneq ("$(wildcard $(LOCAL_DEPS_PREFIX)/curl/include/curl/curl.h)","")
+      CURL_PREFIX := $(LOCAL_DEPS_PREFIX)/curl
+      $(info libcurl: using custom prefix $(CURL_PREFIX))
     endif
   endif
 endif
 ifndef CURL_PREFIX
-  ifeq ($(USE_SYSTEM_LIBS), 1)
-    HAS_SYSTEM_CURL := $(shell curl-config --libs 2>/dev/null)
-    ifdef HAS_SYSTEM_CURL
-      CURL_PREFIX := /usr
-      $(info libcurl: using system prefix)
-    endif
+  # Fall back to the compiler's default search path (system libraries,
+  # or the cross sysroot). Verify with a compile+link probe.
+  HAS_DEFAULT_CURL := $(shell printf '#include <curl/curl.h>\nint main(void) { return 0; }' | $(CC) -x c - -c -o /dev/null >/dev/null 2>&1 && { test "`$(CC) -print-file-name=libcurl.so`" != "libcurl.so" || test "`$(CC) -print-file-name=libcurl.a`" != "libcurl.a"; } && echo -n 1 || echo -n 0)
+  ifeq ($(HAS_DEFAULT_CURL), 1)
+    CURL_PREFIX := default
+    $(info libcurl: using compiler default search path)
   endif
 endif
 
@@ -133,25 +128,34 @@ ifeq ("$(CURL_PREFIX)","")
   CURL_CFLAGS :=
   CURL_LDFLAGS :=
   $(warning libcurl not found, geosite URL download will be disabled)
+else ifeq ($(CURL_PREFIX),default)
+  CURL_CFLAGS := -DUSE_CURL
+  CURL_LDFLAGS := -lcurl
+  CURL_RPATH :=
 else
   # libcurl link mode: prefer shared if available, fallback to static
-  CURL_LIBDIR := $(CURL_PREFIX)/lib
-  ifneq ("$(wildcard $(CURL_LIBDIR)/libcurl.so)","")
+  # The install may use lib/ or lib64/ (matching the OpenSSL layout)
+  ifneq ("$(wildcard $(CURL_PREFIX)/lib/libcurl.so)$(wildcard $(CURL_PREFIX)/lib/libcurl.a)","")
+    CURL_LIBDIR := $(CURL_PREFIX)/lib
+  else ifneq ("$(wildcard $(CURL_PREFIX)/lib64/libcurl.so)$(wildcard $(CURL_PREFIX)/lib64/libcurl.a)","")
+    CURL_LIBDIR := $(CURL_PREFIX)/lib64
+  endif
+  ifndef CURL_LIBDIR
+    ifeq ($(filter clean,$(MAKECMDGOALS)),)
+      $(error libcurl libraries not found in $(CURL_PREFIX)/lib or $(CURL_PREFIX)/lib64)
+    endif
+  else ifneq ("$(wildcard $(CURL_LIBDIR)/libcurl.so)","")
     # Shared libcurl found
     CURL_CFLAGS := -DUSE_CURL -I$(CURL_PREFIX)/include
     CURL_LDFLAGS := -L$(CURL_LIBDIR) -lcurl
     CURL_RPATH := -Wl,-rpath,$(CURL_LIBDIR)
     $(info libcurl: dynamic linking from $(CURL_LIBDIR))
-  else ifneq ("$(wildcard $(CURL_LIBDIR)/libcurl.a)","")
+  else
     # Static libcurl found
     CURL_CFLAGS := -DUSE_CURL -DUSE_CURL_STATIC -I$(CURL_PREFIX)/include
     CURL_LDFLAGS := $(CURL_LIBDIR)/libcurl.a
     CURL_RPATH :=
     $(info libcurl: static linking from $(CURL_LIBDIR))
-  else
-    ifeq ($(filter clean,$(MAKECMDGOALS)),)
-      $(error libcurl libraries not found in $(CURL_LIBDIR))
-    endif
   endif
 endif
 

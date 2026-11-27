@@ -12,8 +12,8 @@
 FROM --platform=linux/amd64 alpine:3.24 AS base
 
 # Version arguments (override with --build-arg)
-ARG OPENSSL_VERSION=4.0.1
-ARG CURL_VERSION=8.20.0
+ARG OPENSSL_VERSION=4.1.0
+ARG CURL_VERSION=8.23.0
 
 # --- C build tools ---
 RUN apk add --no-cache \

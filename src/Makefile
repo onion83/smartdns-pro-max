@@ -25,11 +25,27 @@ MAIN_OBJ = main.o
 
 # ============================================================================
 # Dependency detection: OpenSSL + libcurl
-# Priority: ../third_party/ (vendored, built by third_party/build_*.sh)
+# Priority: ../third_party/ (sources fetched and built by
+# third_party/build_*.sh, not committed to the repo)
 # > LOCAL_DEPS_PREFIX (e.g. /opt in the builder images)
 # > compiler default search path (system libraries, or the cross
 #   toolchain sysroot which is part of the default search path)
+# If nothing is found and this is a native (non-cross) build, the
+# third_party build scripts are run once to download and build the
+# dependencies into ../third_party/. Set DEPS_AUTO_FETCH=0 to disable,
+# or =1 to force even for cross builds.
 # ============================================================================
+
+# Auto-fetch is for native builds: the third_party scripts build with
+# the host compiler, so fetching for a cross compiler would produce
+# wrong-architecture libraries. Cross builds use the sysroot instead.
+ifeq ($(DEPS_AUTO_FETCH),)
+  ifneq ($(filter %linux%,$(CC) $(CROSS_COMPILE)),)
+    DEPS_AUTO_FETCH := 0
+  else
+    DEPS_AUTO_FETCH := 1
+  endif
+endif
 
 # --- OpenSSL detection ---
 # Search order: ../third_party/openssl/install > LOCAL_DEPS_PREFIX/openssl > default search path
@@ -58,6 +74,19 @@ ifndef OPENSSL_PREFIX
   ifeq ($(HAS_DEFAULT_OPENSSL), 1)
     OPENSSL_PREFIX := default
     $(info OpenSSL: using compiler default search path)
+  endif
+endif
+ifndef OPENSSL_PREFIX
+  ifeq ($(filter clean,$(MAKECMDGOALS)),)
+    ifeq ($(DEPS_AUTO_FETCH),1)
+      # Last resort: download and build OpenSSL into ../third_party/.
+      $(info OpenSSL: not found anywhere, fetching and building into ../third_party (first build takes a few minutes)...)
+      _OPENSSL_FETCH := $(shell sh ../third_party/build_openssl.sh 1>&2)
+      ifneq ("$(wildcard ../third_party/openssl/install/include/openssl/ssl.h)","")
+        OPENSSL_PREFIX := ../third_party/openssl/install
+        $(info OpenSSL: using third_party prefix $(OPENSSL_PREFIX))
+      endif
+    endif
   endif
 endif
 ifndef OPENSSL_PREFIX
@@ -121,6 +150,19 @@ ifndef CURL_PREFIX
   ifeq ($(HAS_DEFAULT_CURL), 1)
     CURL_PREFIX := default
     $(info libcurl: using compiler default search path)
+  endif
+endif
+ifndef CURL_PREFIX
+  ifeq ($(filter clean,$(MAKECMDGOALS)),)
+    ifeq ($(DEPS_AUTO_FETCH),1)
+      # Same last resort as OpenSSL: fetch and build into ../third_party/.
+      $(info libcurl: not found anywhere, fetching and building into ../third_party...)
+      _CURL_FETCH := $(shell sh ../third_party/build_curl.sh 1>&2)
+      ifneq ("$(wildcard ../third_party/curl/install/include/curl/curl.h)","")
+        CURL_PREFIX := ../third_party/curl/install
+        $(info libcurl: using third_party prefix $(CURL_PREFIX))
+      endif
+    endif
   endif
 endif
 

@@ -1,8 +1,8 @@
 # Build smartdns for four Linux variants and pack each variant into
 # two gzip tarballs (plain and with-UI):
 #
-#   smartdns-linux-<arch>-<libc>-<YYYYMMDD>.gz      (no UI)
-#   smartdns-ui-linux-<arch>-<libc>-<YYYYMMDD>.gz   (with UI)
+#   smartdns-linux-<arch>-<libc>-<YYYYMMDD>.tar.gz      (no UI)
+#   smartdns-ui-linux-<arch>-<libc>-<YYYYMMDD>.tar.gz   (with UI)
 #
 #   <arch>: amd64 / arm64, <libc>: glibc / musl, date in Asia/Shanghai.
 #
@@ -268,12 +268,12 @@ jobs:
         run: |
           export LOCAL_DEPS_PREFIX=/opt
           DATE="$(TZ=Asia/Shanghai date +%Y%m%d)"
-          PKG_PLAIN="smartdns-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.gz"
-          PKG_UI="smartdns-ui-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.gz"
+          PKG_PLAIN="smartdns-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.tar.gz"
+          PKG_UI="smartdns-ui-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.tar.gz"
           echo "PKG_PLAIN=${PKG_PLAIN}" >> "$GITHUB_ENV"
           echo "PKG_UI=${PKG_UI}" >> "$GITHUB_ENV"
-          echo "PKG_PLAIN_BASE=${PKG_PLAIN%.gz}" >> "$GITHUB_ENV"
-          echo "PKG_UI_BASE=${PKG_UI%.gz}" >> "$GITHUB_ENV"
+          echo "PKG_PLAIN_BASE=${PKG_PLAIN%.tar.gz}" >> "$GITHUB_ENV"
+          echo "PKG_UI_BASE=${PKG_UI%.tar.gz}" >> "$GITHUB_ENV"
           test -f www-out/index.html
           check_needed() {
             # The /opt dependencies are static-only builds, so the
@@ -325,12 +325,12 @@ jobs:
         shell: bash
         run: |
           DATE="$(TZ=Asia/Shanghai date +%Y%m%d)"
-          PKG_PLAIN="smartdns-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.gz"
-          PKG_UI="smartdns-ui-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.gz"
+          PKG_PLAIN="smartdns-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.tar.gz"
+          PKG_UI="smartdns-ui-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.tar.gz"
           echo "PKG_PLAIN=${PKG_PLAIN}" >> "$GITHUB_ENV"
           echo "PKG_UI=${PKG_UI}" >> "$GITHUB_ENV"
-          echo "PKG_PLAIN_BASE=${PKG_PLAIN%.gz}" >> "$GITHUB_ENV"
-          echo "PKG_UI_BASE=${PKG_UI%.gz}" >> "$GITHUB_ENV"
+          echo "PKG_PLAIN_BASE=${PKG_PLAIN%.tar.gz}" >> "$GITHUB_ENV"
+          echo "PKG_UI_BASE=${PKG_UI%.tar.gz}" >> "$GITHUB_ENV"
           export PKG_PLAIN PKG_UI
           # Stage the host-cached bindgen (actions/cache path) into the
           # workspace so the container can reuse it; the container uses

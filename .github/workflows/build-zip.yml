@@ -137,6 +137,8 @@ jobs:
           # libcurl.a was built against the shared OpenSSL and references
           # symbols the static libssl.a does not export, so the Makefile
           # links that part dynamically. Everything else must be static.
+          # Use readelf's NEEDED list (not ldd: the system libz on the
+          # runner can be pulled in transitively by the shared OpenSSL).
           if readelf -d src/smartdns | grep -E "NEEDED.*(libcurl|libz\.|libzstd|libbrotli)"; then
             echo "ERROR: binary still depends on a dynamic curl/z/compression library" >&2
             exit 1

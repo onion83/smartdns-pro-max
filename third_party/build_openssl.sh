@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build OpenSSL as both static and shared libraries for smartdns (musl-compatible).
 # Usage: third_party/build_openssl.sh [VERSION] [static|shared|both]
-#   VERSION  defaults to 3.5.7
+#   VERSION  defaults to 4.1.0
 #   Mode     defaults to both (build both static and shared)
 #
 # Environment variables:
@@ -11,7 +11,7 @@
 
 set -e
 
-OPENSSL_VERSION="${1:-4.0.1}"
+OPENSSL_VERSION="${1:-4.1.0}"
 BUILD_MODE="${2:-both}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DOWNLOAD_DIR="${OPENSSL_DOWNLOAD_DIR:-${SCRIPT_DIR}/openssl}"

@@ -35,8 +35,10 @@
 # (the same approach as the repo's Dockerfile.builder-base) so curl
 # picks the features up and their archives exist at link time.
 # glibc jobs run natively on GitHub runners (x86_64 and ARM64); the
-# musl jobs run inside Alpine on the matching-arch runner, mirroring
-# Dockerfile.builder-base-amd64.
+# x86_64-musl job runs inside Alpine as a job container, mirroring
+# Dockerfile.builder-base-amd64. The arm64-musl job cannot (GitHub
+# does not support JavaScript actions in Alpine containers on Arm64),
+# so it drives Alpine through docker from the host instead.
 
 name: Build packages
 
@@ -107,8 +109,8 @@ jobs:
             libc: musl
           - label: linux-aarch64-musl
             runner: ubuntu-24.04-arm
-            container: alpine:3.24
-            kind: musl
+            container: ~
+            kind: musl-docker
             arch: arm64
             libc: musl
 
@@ -157,7 +159,7 @@ jobs:
           key: ${{ matrix.label }}-bindgen-v1
 
       - name: Install bindgen
-        if: steps.cache-bindgen.outputs.cache-hit != 'true'
+        if: steps.cache-bindgen.outputs.cache-hit != 'true' && matrix.kind != 'musl-docker'
         shell: bash
         run: cargo install --force --locked bindgen-cli
 
@@ -168,6 +170,7 @@ jobs:
           path: www-out
 
       - name: Build custom dependencies into /opt (OpenSSL 4.1.0, curl 8.23.0)
+        if: matrix.kind != 'musl-docker'
         shell: bash
         run: |
           if [ "${{ matrix.kind }}" = "glibc" ]; then SUDO=sudo; else SUDO=; fi
@@ -181,6 +184,7 @@ jobs:
             sh third_party/build_curl.sh 8.23.0 static
 
       - name: Build and pack (plain + ui tarballs)
+        if: matrix.kind != 'musl-docker'
         shell: bash
         run: |
           export LOCAL_DEPS_PREFIX=/opt
@@ -231,6 +235,77 @@ jobs:
           tar -tzf "${PKG_UI}" > ui-list.txt
           head -20 ui-list.txt
           wc -l ui-list.txt
+
+      # arm64-musl cannot use a job container: GitHub does not support
+      # JavaScript actions in Alpine containers on Arm64 runners. So
+      # this job runs on the host and drives Alpine through docker;
+      # only the compile itself happens inside the container, while
+      # checkout/artifacts/release steps stay on the host.
+      - name: Build and pack (arm64-musl, via docker)
+        if: matrix.kind == 'musl-docker'
+        shell: bash
+        run: |
+          DATE="$(TZ=Asia/Shanghai date +%Y%m%d)"
+          PKG_PLAIN="smartdns-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.gz"
+          PKG_UI="smartdns-ui-linux-${{ matrix.arch }}-${{ matrix.libc }}-${DATE}.gz"
+          echo "PKG_PLAIN=${PKG_PLAIN}" >> "$GITHUB_ENV"
+          echo "PKG_UI=${PKG_UI}" >> "$GITHUB_ENV"
+          echo "PKG_PLAIN_BASE=${PKG_PLAIN%.gz}" >> "$GITHUB_ENV"
+          echo "PKG_UI_BASE=${PKG_UI%.gz}" >> "$GITHUB_ENV"
+          export PKG_PLAIN PKG_UI
+          mkdir -p "$HOME/.cargo/bin"
+          cat > inside-build.sh <<'EOS'
+          apk add --no-cache \
+            build-base linux-headers musl-dev zlib-dev zlib-static \
+            zstd-dev zstd-static brotli-dev brotli-static \
+            pkgconf git ca-certificates perl wget curl bash tzdata \
+            llvm-dev clang clang-dev file
+          git config --global --add safe.directory /work
+          export PATH="$HOME/.cargo/bin:$PATH"
+          if [ ! -x "$HOME/.cargo/bin/rustc" ]; then
+            wget -qO- https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          if [ ! -x "$HOME/.cargo/bin/bindgen" ]; then
+            cargo install --force --locked bindgen-cli
+          fi
+          export LOCAL_DEPS_PREFIX=/opt
+          env LOCAL_OPENSSL_INSTALL=/opt/openssl \
+            sh third_party/build_openssl.sh 4.1.0 static
+          env LIBS="-ldl -lpthread -lz" LOCAL_CURL_INSTALL=/opt/curl \
+            LOCAL_OPENSSL_INSTALL=/opt/openssl \
+            sh third_party/build_curl.sh 8.23.0 static
+          check_needed() {
+            if readelf -d "$1" | grep -E "NEEDED.*(libssl|libcrypto|libcurl|libz\.|libzstd|libbrotli)"; then
+              echo "ERROR: binary still depends on a dynamic ssl/curl/z library" >&2
+              exit 1
+            fi
+          }
+          test -f www-out/index.html
+          make clean || true
+          make WITH_UI=0 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
+          file src/smartdns
+          check_needed src/smartdns
+          mkdir -p stage-plain/smartdns
+          cp src/smartdns stage-plain/smartdns/
+          (cd stage-plain && tar -cf - smartdns | gzip -9 > "../${PKG_PLAIN}")
+          make clean || true
+          make WITH_UI=1 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
+          file src/smartdns plugin/smartdns-ui/target/smartdns_ui.so
+          check_needed src/smartdns
+          mkdir -p stage-ui/smartdns/www
+          cp src/smartdns plugin/smartdns-ui/target/smartdns_ui.so stage-ui/smartdns/
+          cp -r www-out/. stage-ui/smartdns/www/
+          test -f stage-ui/smartdns/www/index.html
+          (cd stage-ui && tar -cf - smartdns | gzip -9 > "../${PKG_UI}")
+          tar -tzf "${PKG_PLAIN}"
+          tar -tzf "${PKG_UI}" > ui-list.txt
+          head -20 ui-list.txt
+          EOS
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/work" -w /work \
+            -v "${HOME}/.cargo:/root/.cargo" \
+            -e PKG_PLAIN -e PKG_UI \
+            alpine:3.24 sh -e /work/inside-build.sh
 
       - name: Upload plain tarball as artifact
         uses: actions/upload-artifact@v6

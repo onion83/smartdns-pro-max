@@ -1,0 +1,159 @@
+# Build smartdns + smartdns_ui.so for three Linux variants and pack
+# each variant into a single zip containing only those two files.
+#
+#   smartdns-<version>-linux-x86_64-glibc.zip
+#   smartdns-<version>-linux-x86_64-musl.zip
+#   smartdns-<version>-linux-aarch64-glibc.zip
+#
+# Manual trigger only (Actions -> "Build zip packages" -> Run workflow).
+# Pick the branch to build when dispatching. The zips are attached to
+# the "nightly" GitHub Release (same place release.yml uploads to).
+#
+# All jobs prefer the repo's own third-party dependencies: OpenSSL 4.1.0
+# and curl 8.23.0 are built into /opt by the repo's third_party scripts
+# and picked up via LOCAL_DEPS_PREFIX=/opt, which outranks the system
+# libraries in src/Makefile detection (system is only the fallback).
+# Linking is STATIC_DEPS: OpenSSL, libcurl and zlib are linked from
+# static archives directly, so the custom libcurl is compiled in, not
+# loaded at runtime. libc/libgcc_s deliberately stay dynamic: the
+# Makefile's full-static mode (-static) is incompatible with loading
+# the smartdns_ui.so plugin via dlopen. The plugin itself is built
+# fully self-contained (musl target, gcc_s replaced by static libgcc
+# via the repo's ld-static-gcc.sh wrapper).
+# zlib: libcurl depends on it. It is installed BEFORE building curl
+# (apk zlib-static / apt zlib1g-dev, the same approach as the repo's
+# Dockerfile.builder-base) so curl picks it up, and the final link
+# scopes -lz with -Wl,-Bstatic, leaving no DT_NEEDED for libz.
+# glibc jobs run natively on GitHub runners (x86_64 and ARM64); the musl
+# job runs inside Alpine, mirroring Dockerfile.builder-base-amd64.
+
+name: Build zip packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64-glibc
+            runner: ubuntu-24.04
+            container: ~
+            kind: glibc
+          - label: linux-aarch64-glibc
+            runner: ubuntu-24.04-arm
+            container: ~
+            kind: glibc
+          - label: linux-x86_64-musl
+            runner: ubuntu-24.04
+            container: alpine:3.24
+            kind: musl
+
+    steps:
+      - name: Install tools (glibc runners)
+        if: matrix.kind == 'glibc'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config git perl wget ca-certificates \
+            zlib1g-dev clang libclang-dev zip file
+          # zlib1g-dev ships libz.a alongside libz.so; the STATIC_DEPS
+          # link scopes -lz with -Bstatic, so no runtime libz is needed.
+
+      - name: Install tools (musl, Alpine)
+        if: matrix.kind == 'musl'
+        run: |
+          apk add --no-cache \
+            build-base linux-headers musl-dev zlib-dev zlib-static \
+            pkgconf git ca-certificates perl wget bash \
+            llvm-dev clang clang-dev zip file
+
+      - name: Install Rust
+        if: matrix.kind == 'glibc'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust (musl, Alpine)
+        if: matrix.kind == 'musl'
+        shell: bash
+        run: |
+          wget -qO- https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache bindgen
+        id: cache-bindgen
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/bindgen
+          key: ${{ matrix.label }}-bindgen-v1
+
+      - name: Install bindgen
+        if: steps.cache-bindgen.outputs.cache-hit != 'true'
+        shell: bash
+        run: cargo install --force --locked bindgen-cli
+
+      - name: Build custom dependencies into /opt (OpenSSL 4.1.0, curl 8.23.0)
+        shell: bash
+        run: |
+          if [ "${{ matrix.kind }}" = "glibc" ]; then SUDO=sudo; else SUDO=; fi
+          $SUDO env LOCAL_OPENSSL_INSTALL=/opt/openssl \
+            sh third_party/build_openssl.sh 4.1.0 both
+          $SUDO env LIBS="-ldl -lpthread" LOCAL_CURL_INSTALL=/opt/curl \
+            LOCAL_OPENSSL_INSTALL=/opt/openssl \
+            sh third_party/build_curl.sh 8.23.0 both
+
+      - name: Build smartdns + UI plugin
+        shell: bash
+        run: |
+          export LOCAL_DEPS_PREFIX=/opt
+          make clean || true
+          make WITH_UI=1 OPTIMIZE_SIZE=1 STATIC_DEPS=1 -j"$(nproc)"
+
+      - name: Pack zip (smartdns + smartdns_ui.so only)
+        shell: bash
+        run: |
+          VER="$(./src/smartdns -v | awk '{print $2}')"
+          PKG="smartdns-${VER}-${{ matrix.label }}.zip"
+          echo "PKG=${PKG}" >> "$GITHUB_ENV"
+          file src/smartdns plugin/smartdns-ui/target/smartdns_ui.so
+          echo "== dynamic dependencies (libc/libgcc_s only, by design) =="
+          ldd src/smartdns || true
+          ldd plugin/smartdns-ui/target/smartdns_ui.so || true
+          if readelf -d src/smartdns | grep -E "NEEDED.*(libssl|libcrypto|libcurl|libz\.)"; then
+            echo "ERROR: binary still depends on a system ssl/curl/z library" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          cp src/smartdns plugin/smartdns-ui/target/smartdns_ui.so dist/
+          (cd dist && zip -9 "../${PKG}" smartdns smartdns_ui.so)
+          unzip -l "${PKG}"
+
+      - name: Upload zip as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ env.PKG }}
+          if-no-files-found: error
+
+      - name: Attach zip to nightly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view nightly >/dev/null 2>&1 || \
+            gh release create nightly --prerelease \
+              --title "Nightly builds" \
+              --notes "Automated nightly and manual builds."
+          gh release upload nightly "${PKG}" --clobber

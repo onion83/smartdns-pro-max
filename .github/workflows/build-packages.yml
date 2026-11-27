@@ -1,4 +1,4 @@
-# Build smartdns for three Linux variants and pack each variant into
+# Build smartdns for four Linux variants and pack each variant into
 # two gzip tarballs (plain and with-UI):
 #
 #   smartdns-linux-<arch>-<libc>-<YYYYMMDD>.gz      (no UI)
@@ -35,7 +35,8 @@
 # (the same approach as the repo's Dockerfile.builder-base) so curl
 # picks the features up and their archives exist at link time.
 # glibc jobs run natively on GitHub runners (x86_64 and ARM64); the
-# musl job runs inside Alpine, mirroring Dockerfile.builder-base-amd64.
+# musl jobs run inside Alpine on the matching-arch runner, mirroring
+# Dockerfile.builder-base-amd64.
 
 name: Build packages
 
@@ -75,6 +76,7 @@ jobs:
           name: www
           path: smartdns-webui/out
           if-no-files-found: error
+          retention-days: 30
 
   build:
     name: ${{ matrix.label }}
@@ -102,6 +104,12 @@ jobs:
             container: alpine:3.24
             kind: musl
             arch: amd64
+            libc: musl
+          - label: linux-aarch64-musl
+            runner: ubuntu-24.04-arm
+            container: alpine:3.24
+            kind: musl
+            arch: arm64
             libc: musl
 
     steps:
@@ -230,6 +238,7 @@ jobs:
           name: ${{ env.PKG_PLAIN_BASE }}
           path: ${{ env.PKG_PLAIN }}
           if-no-files-found: error
+          retention-days: 30
 
       - name: Upload ui tarball as artifact
         uses: actions/upload-artifact@v6
@@ -237,6 +246,7 @@ jobs:
           name: ${{ env.PKG_UI_BASE }}
           path: ${{ env.PKG_UI }}
           if-no-files-found: error
+          retention-days: 30
 
       - name: Attach tarballs to nightly release
         shell: bash

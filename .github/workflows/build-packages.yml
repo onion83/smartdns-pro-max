@@ -474,9 +474,31 @@ jobs:
           # it, so a failed create (another job won) is fine: the
           # upload below is the idempotent part and runs for everyone.
           TAG="Release-$(TZ=Asia/Shanghai date +%y%m%d)"
+          # Release notes: the changes since the previous dated
+          # release, so users downloading this release can see what
+          # changed. The checkout is full-depth (fetch-depth: 0), so
+          # tags and history are available. Today's tag is excluded
+          # from the search so a same-day re-run still diffs against
+          # the previous day. Merge commits are skipped as noise.
+          git fetch --tags --quiet || true
+          PREV="$(git describe --tags --match 'Release-*' --exclude "${TAG}" --abbrev=0 HEAD 2>/dev/null || true)"
+          if [ -n "${PREV}" ]; then
+            echo "## Changes since ${PREV}" > release-notes.md
+            echo >> release-notes.md
+            git log "${PREV}..HEAD" --no-merges --pretty=format:'- %s (%h)' >> release-notes.md
+          else
+            echo "## Changes" > release-notes.md
+            echo >> release-notes.md
+            git log -30 --no-merges --pretty=format:'- %s (%h)' >> release-notes.md
+          fi
+          echo >> release-notes.md
           gh release view "${TAG}" >/dev/null 2>&1 || \
             gh release create "${TAG}" --target "${GITHUB_SHA}" \
               --title "${TAG}" \
-              --notes "Automated build of SmartDNS Pro Max (${GITHUB_REF_NAME}, ${GITHUB_SHA})." \
+              --notes-file release-notes.md \
               || true
           gh release upload "${TAG}" "${PKG_PLAIN}" "${PKG_UI}" --clobber
+          # Refresh the notes even when the release already existed
+          # (same-day re-run): every job computes identical notes,
+          # so concurrent identical edits are harmless.
+          gh release edit "${TAG}" --notes-file release-notes.md || true

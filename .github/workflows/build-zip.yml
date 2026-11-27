@@ -155,7 +155,7 @@ jobs:
           unzip -l "${PKG}"
 
       - name: Upload zip as artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ env.PKG_BASE }}
           path: ${{ env.PKG }}

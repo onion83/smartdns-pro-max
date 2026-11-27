@@ -484,14 +484,19 @@ jobs:
           PREV="$(git describe --tags --match 'Release-*' --exclude "${TAG}" --abbrev=0 HEAD 2>/dev/null || true)"
           if [ -n "${PREV}" ]; then
             echo "## Changes since ${PREV}" > release-notes.md
-            echo >> release-notes.md
-            git log "${PREV}..HEAD" --no-merges --pretty=format:'- %s (%h)' >> release-notes.md
+            RANGE="${PREV}..HEAD"
           else
             echo "## Changes" > release-notes.md
-            echo >> release-notes.md
-            git log -30 --no-merges --pretty=format:'- %s (%h)' >> release-notes.md
+            RANGE="-30"
           fi
           echo >> release-notes.md
+          # The same change can exist twice in history (a line of
+          # work carried on two branches and later merged), so
+          # dedupe by commit subject, keeping the first occurrence.
+          git log ${RANGE} --no-merges --pretty=format:'%s%x09%h' | \
+            awk -F '\t' '!seen[$1]++ { printf "- %s (%s)\n", $1, $2 }' >> release-notes.md
+          echo >> release-notes.md
+          echo "**Full Changelog**: https://github.com/onion83/smartdns-pro-max/blob/feature/geosite/doc/ChangeLog.md" >> release-notes.md
           gh release view "${TAG}" >/dev/null 2>&1 || \
             gh release create "${TAG}" --target "${GITHUB_SHA}" \
               --title "${TAG}" \

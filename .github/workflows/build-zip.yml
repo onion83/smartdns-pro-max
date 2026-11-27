@@ -76,7 +76,7 @@ jobs:
             build-base linux-headers musl-dev zlib-dev zlib-static \
             zstd-dev zstd-static brotli-dev brotli-static \
             pkgconf git ca-certificates perl wget bash \
-            llvm-dev clang clang-dev zip file
+            llvm-dev clang clang-dev zip file github-cli
 
       - name: Install Rust
         if: matrix.kind == 'glibc'
@@ -129,6 +129,7 @@ jobs:
           VER="$(./src/smartdns -v | awk '{print $2}')"
           PKG="smartdns-${VER}-${{ matrix.label }}.zip"
           echo "PKG=${PKG}" >> "$GITHUB_ENV"
+          echo "PKG_BASE=${PKG%.zip}" >> "$GITHUB_ENV"
           file src/smartdns plugin/smartdns-ui/target/smartdns_ui.so
           echo "== dynamic dependencies (libc/libgcc_s only, by design) =="
           ldd src/smartdns || true
@@ -151,7 +152,7 @@ jobs:
       - name: Upload zip as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.PKG }}
+          name: ${{ env.PKG_BASE }}
           path: ${{ env.PKG }}
           if-no-files-found: error
 

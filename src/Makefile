@@ -309,6 +309,18 @@ else ifdef STATIC_DEPS
       override LDFLAGS += $(CURL_LDFLAGS)
     endif
   endif
+  # libcurl's own dependency tail (compression libs it was configured
+  # with): link statically when the archives exist. libcurl.a also
+  # references OpenSSL symbols that a static libssl.a lacks when curl
+  # was built against the shared library (OCSP_*, SSL_alert_*); repeat
+  # the SSL archives after libcurl.a so those resolve from libssl.so
+  # via the -L path instead.
+  ifneq ("$(wildcard $(CURL_LIBDIR)/libcurl.a)","")
+    override LDFLAGS += -Wl,-Bstatic -lzstd -lbrotlidec -lbrotlicommon -Wl,-Bdynamic
+    ifneq ("$(wildcard $(OPENSSL_LIBDIR)/libssl.so)","")
+      override LDFLAGS += -L$(OPENSSL_LIBDIR) -lssl -lcrypto
+    endif
+  endif
  override LDFLAGS += -Wl,-Bstatic -lz -Wl,-Bdynamic -lpthread -ldl -lm -rdynamic
 else
   # Dynamic build: use detected SSL_LDFLAGS and CURL_LDFLAGS as-is

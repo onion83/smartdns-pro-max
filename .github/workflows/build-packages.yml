@@ -496,7 +496,7 @@ jobs:
           git log ${RANGE} --no-merges --pretty=format:'%s%x09%h' | \
             awk -F '\t' '!seen[$1]++ { printf "- %s (%s)\n", $1, $2 }' >> release-notes.md
           echo >> release-notes.md
-          echo "**Full Changelog**: https://github.com/onion83/smartdns-pro-max/blob/feature/geosite/doc/ChangeLog.md" >> release-notes.md
+          echo "👀 [Full ChangeLog](https://github.com/onion83/smartdns-pro-max/blob/feature/geosite/doc/ChangeLog.md)" >> release-notes.md
           gh release view "${TAG}" >/dev/null 2>&1 || \
             gh release create "${TAG}" --target "${GITHUB_SHA}" \
               --title "${TAG}" \

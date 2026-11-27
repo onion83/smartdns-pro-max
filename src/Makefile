@@ -321,6 +321,11 @@ else ifdef STATIC_DEPS
       override LDFLAGS += -L$(OPENSSL_LIBDIR) -lssl -lcrypto
     endif
   endif
+  # -lz must come after libcurl.a too (curl's version.c references zlib
+  # symbols); the static-only -lz below only satisfies smartdns itself.
+  ifneq ("$(wildcard $(CURL_LIBDIR)/libcurl.a)","")
+    override LDFLAGS += -Wl,-Bstatic -lz -Wl,-Bdynamic
+  endif
  override LDFLAGS += -Wl,-Bstatic -lz -Wl,-Bdynamic -lpthread -ldl -lm -rdynamic
 else
   # Dynamic build: use detected SSL_LDFLAGS and CURL_LDFLAGS as-is

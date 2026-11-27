@@ -14,9 +14,11 @@
 # "www" job from the separate onion83/smartdns-webui project (Next.js
 # static export) and copied into every platform's UI package.
 #
-# Manual trigger only (Actions -> "Build packages" -> Run workflow).
-# Pick the branch to build when dispatching. The tarballs are attached
-# to the "nightly" GitHub Release (same place release.yml uploads to).
+# Manual trigger only (Actions -> "Build SmartDNS Pro Max" -> Run
+# workflow). Pick the branch to build when dispatching. The tarballs
+# are published to a formal (non-prerelease) GitHub Release tagged
+# "Release-YYMMDD" (Asia/Shanghai date), one per day, so the newest
+# build shows as the latest release on the repository home page.
 #
 # All platform jobs prefer the repo's own third-party dependencies:
 # OpenSSL 4.1.0 and curl 8.23.0 are built into /opt by the repo's
@@ -40,7 +42,7 @@
 # does not support JavaScript actions in Alpine containers on Arm64),
 # so it drives Alpine through docker from the host instead.
 
-name: Build packages
+name: Build SmartDNS Pro Max
 
 on:
   workflow_dispatch:
@@ -456,7 +458,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach tarballs to nightly release
+      - name: Publish tarballs to the dated formal release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -464,8 +466,16 @@ jobs:
           # gh shells out to git; inside the musl container git refuses
           # the checkout over ownership, so mark it safe first.
           git config --global --add safe.directory "${GITHUB_WORKSPACE}" || true
-          gh release view nightly >/dev/null 2>&1 || \
-            gh release create nightly --prerelease \
-              --title "Nightly builds" \
-              --notes "Automated nightly and manual builds."
-          gh release upload nightly "${PKG_PLAIN}" "${PKG_UI}" --clobber
+          # One formal release per day, tagged Release-YYMMDD
+          # (Asia/Shanghai). Deliberately NOT a prerelease: the newest
+          # dated release becomes the "latest" release shown on the
+          # repository home page. The four platform jobs race to create
+          # it, so a failed create (another job won) is fine: the
+          # upload below is the idempotent part and runs for everyone.
+          TAG="Release-$(TZ=Asia/Shanghai date +%y%m%d)"
+          gh release view "${TAG}" >/dev/null 2>&1 || \
+            gh release create "${TAG}" --target "${GITHUB_SHA}" \
+              --title "${TAG}" \
+              --notes "Automated build of SmartDNS Pro Max (${GITHUB_REF_NAME}, ${GITHUB_SHA})." \
+              || true
+          gh release upload "${TAG}" "${PKG_PLAIN}" "${PKG_UI}" --clobber
